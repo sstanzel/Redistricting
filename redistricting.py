@@ -151,101 +151,6 @@ STATES = {
 
 APPORTIONMENT_YEAR = 2020
 
-COLORADO_CITIES = [
-    ("Denver",            39.7392, -104.9903),
-    ("Colorado Springs",  38.8339, -104.8214),
-    ("Aurora",            39.7294, -104.8319),
-    ("Fort Collins",      40.5853, -105.0844),
-    ("Lakewood",          39.7047, -105.0814),
-    ("Thornton",          39.8680, -104.9719),
-    ("Arvada",            39.8028, -105.0875),
-    ("Westminster",       39.8367, -105.0372),
-    ("Pueblo",            38.2544, -104.6091),
-    ("Centennial",        39.5807, -104.8772),
-    ("Boulder",           40.0150, -105.2705),
-    ("Highlands Ranch",   39.5480, -104.9694),
-    ("Greeley",           40.4233, -104.7091),
-    ("Longmont",          40.1672, -105.1019),
-    ("Loveland",          40.3978, -105.0749),
-    ("Broomfield",        39.9205, -105.0866),
-    ("Castle Rock",       39.3722, -104.8561),
-    ("Commerce City",     39.8083, -104.9339),
-    ("Parker",            39.5186, -104.7614),
-    ("Northglenn",        39.8872, -104.9811),
-    ("Brighton",          39.9855, -104.8197),
-    ("Pueblo West",       38.3442, -104.7231),
-    ("Security-Widefield",38.7483, -104.7147),
-    ("Fountain",          38.6822, -104.7008),
-    ("Erie",              40.0503, -105.0469),
-    ("Frederick",         40.0997, -104.9414),
-    ("Windsor",           40.4775, -104.9014),
-    ("Evans",             40.3758, -104.6914),
-    ("Firestone",         40.1542, -104.9442),
-    ("Littleton",         39.6133, -105.0166),
-    ("Englewood",         39.6486, -104.9878),
-    ("Wheat Ridge",       39.7661, -105.0772),
-    ("Golden",            39.7555, -105.2211),
-    ("Lone Tree",         39.5272, -104.8725),
-    ("Greenwood Village", 39.6197, -104.8911),
-    ("Sheridan",          39.6444, -105.0175),
-    ("Manitou Springs",   38.8594, -104.9161),
-    ("Monument",          39.0928, -104.8728),
-    ("Black Forest",      39.0181, -104.6894),
-    ("Woodland Park",     38.9939, -105.0569),
-    ("Canon City",        38.4408, -105.2428),
-    ("Florence",          38.3908, -105.1172),
-    ("La Junta",          37.9847, -103.5430),
-    ("Trinidad",          37.1694, -104.5003),
-    ("Lamar",             38.0872, -102.6207),
-    ("Walsenburg",        37.6236, -104.7819),
-    ("Alamosa",           37.4697, -105.8700),
-    ("Monte Vista",       37.5797, -106.1486),
-    ("Del Norte",         37.6769, -106.3544),
-    ("Antonito",          37.0814, -106.0103),
-    ("Grand Junction",    39.0639, -108.5506),
-    ("Montrose",          38.4783, -107.8762),
-    ("Durango",           37.2753, -107.8801),
-    ("Glenwood Springs",  39.5505, -107.3248),
-    ("Steamboat Springs", 40.4850, -106.8317),
-    ("Craig",             40.5153, -107.5465),
-    ("Cortez",            37.3489, -108.5859),
-    ("Telluride",         37.9375, -107.8123),
-    ("Delta",             38.7397, -108.0756),
-    ("Rifle",             39.5316, -107.7832),
-    ("Fruita",            39.1583, -108.7287),
-    ("Palisade",          39.1152, -108.3540),
-    ("Meeker",            40.0372, -107.9123),
-    ("Rangely",           40.0875, -108.8014),
-    ("Pagosa Springs",    37.2694, -107.0097),
-    ("Silverton",         37.8119, -107.6648),
-    ("Aspen",             39.1911, -106.8175),
-    ("Vail",              39.6433, -106.3781),
-    ("Breckenridge",      39.4817, -106.0384),
-    ("Keystone",          39.6061, -105.9678),
-    ("Dillon",            39.6294, -106.0442),
-    ("Silverthorne",      39.6325, -106.0694),
-    ("Frisco",            39.5742, -106.0978),
-    ("Edwards",           39.6450, -106.5953),
-    ("Eagle",             39.6553, -106.8283),
-    ("Avon",              39.6317, -106.5228),
-    ("Gypsum",            39.6469, -106.9514),
-    ("Leadville",         39.2508, -106.2925),
-    ("Buena Vista",       38.8422, -106.1317),
-    ("Salida",            38.5347, -105.9986),
-    ("Sterling",          40.6255, -103.2077),
-    ("Fort Morgan",       40.2502, -103.7999),
-    ("Brush",             40.2591, -103.6260),
-    ("Yuma",              40.1244, -102.7157),
-    ("Wray",              40.0755, -102.2227),
-    ("Burlington",        39.3008, -102.2710),
-    ("Springfield",       37.4072, -102.6185),
-    ("Fort Lupton",       40.0836, -104.8031),
-    ("Estes Park",        40.3772, -105.5217),
-    ("Granby",            40.0880, -105.9425),
-    ("Kremmling",         40.0586, -106.3886),
-    ("Walden",            40.7322, -106.2836),
-]
-
 # ── Validate ──────────────────────────────────────────────────
 if STATE_NAME not in STATES:
     print(f"ERROR: '{STATE_NAME}' not in STATES.")
@@ -254,6 +159,10 @@ if STATE_NAME not in STATES:
 STATE       = STATES[STATE_NAME]
 STATE_FIPS  = STATE["fips"]
 N_DISTRICTS = STATE["districts"]
+
+_cities_df  = pd.read_csv("cities.csv") if os.path.exists("cities.csv") else pd.DataFrame()
+_state_rows = _cities_df[_cities_df["state"] == STATE_NAME] if not _cities_df.empty else pd.DataFrame()
+STATE_CITIES = list(zip(_state_rows["city"], _state_rows["lat"], _state_rows["lon"]))
 
 FIRST_CUT_ANGLE = 135.0
 ALT_CUT_ANGLE   = 45.0
@@ -613,7 +522,7 @@ def haversine(lat1,lon1,lat2,lon2):
 def nearest_city(utm_x, utm_y):
     lat,lon = utm_to_latlon(utm_x,utm_y)
     best_d=float('inf'); best_c="Unknown"
-    for city,clat,clon in COLORADO_CITIES:
+    for city,clat,clon in STATE_CITIES:
         d=haversine(lat,lon,clat,clon)
         if d<best_d: best_d=d; best_c=city
     return best_c, round(best_d,1), lat, lon
