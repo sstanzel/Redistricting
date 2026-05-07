@@ -13,10 +13,10 @@ Requirements:
     pip install reportlab pypdf pyproj pillow
 
 To run for any state, change STATE_NAME below, then:
-    python redistricting_v12b.py
+    python redistricting.py
 
 To regenerate maps/PDF only (reuse saved computation):
-    python redistricting_v12b.py  # will auto-detect checkpoint
+    python redistricting.py  # will auto-detect checkpoint
 """
 
 # ── Startup import check ───────────────────────────────────────
