@@ -23,6 +23,8 @@ python election_analysis.py
 
 The redistricting script auto-detects checkpoint `.npy` files — if a prior run completed, heavy computation is skipped and only maps/PDFs are regenerated.
 
+To run a different state, change `STATE_NAME`, then run the same command. Each state's data downloads once into `data/{FIPS}/` and is reused on subsequent runs.
+
 ## Configuration
 
 All user-facing settings are at the top of the script (lines 93–96):
@@ -38,22 +40,29 @@ Changing `STATE_NAME` automatically sets `N_DISTRICTS`, `STATE_FIPS`, and all ou
 
 **City lists:** `COLORADO_CITIES` (lines 154–247) is the only hardcoded state city list. Other states need their own list added or a geocoding API fallback.
 
-## Output
+## Directory Structure
 
-All outputs go to `redistricting_{STATE}_{VERSION}/`:
-- `districts_*.png` — Final district map
-- `summary_*.png` — Population balance chart
-- `census_blocks_*.png` — Raw census block visualization
-- `process_page*.png` — Step-by-step algorithm explainer (one page per 2 splits)
-- `block_assignments_*.csv` — GEOID20 → district number
-- `district_summary_*.csv` — Per-district population, deviation, city, compactness
-- `split_log_*.csv` — Each splitline's angle and balance error
-- `report_*.pdf` — Comprehensive PDF with algorithm explanation and maps
-- `source_code_*.pdf` — Full source for reproducibility
-- `checkpoint_*.npy` — Saved computation state (delete to force recomputation)
-- `election_analysis/` — Created by `election_analysis.py` (see below)
+```
+data/{FIPS}/                    # gitignored — downloaded once per state, reused
+  tl_2020_{FIPS}_tabblock20.zip
+  blocks/                       # extracted Census shapefile
+  centroids_cache.csv           # cached block centroids (generated on first run)
 
-**Colorado result (v12b):** 8 districts, max deviation 0.61% (PASS ✓), average Polsby-Popper compactness ~0.686.
+output/redistricting_{STATE}_{VERSION}/   # gitignored — all generated results
+  districts_*.png               # final district map
+  summary_*.png                 # population balance chart
+  census_blocks_*.png           # raw census block visualization
+  process_page*.png             # step-by-step algorithm explainer
+  block_assignments_*.csv       # GEOID20 → district number
+  district_summary_*.csv        # per-district population, deviation, city, compactness
+  split_log_*.csv               # each splitline's angle and balance error
+  report_*.pdf                  # comprehensive PDF with algorithm explanation and maps
+  source_code_*.pdf             # full source for reproducibility
+  checkpoint_*.npy              # saved computation state (delete to force recomputation)
+  election_analysis/            # created by election_analysis.py (see below)
+```
+
+**Colorado result:** 8 districts, max deviation 0.61% (PASS ✓), average Polsby-Popper compactness ~0.686.
 
 ## Election Analysis Script
 
@@ -74,7 +83,7 @@ Once files are present, the script: spatial-joins precincts to proposed district
 The codebase is a **single monolithic script** (`redistricting.py`, ~1,440 lines) organized into sequential numbered stages, each delimited by `# ── Stage N` comments. Older versions are in `archive/`; the current version is tracked via the `VERSION` constant and git tags.
 
 **Data flow:**
-1. **Load/cache** — Download TIGER shapefile for state FIPS, extract census blocks, cache centroids to `{FIPS}_{STATE}_centroids_cache.csv`
+1. **Load/cache** — Download TIGER shapefile for state FIPS into `data/{FIPS}/`, extract to `blocks/`, cache centroids to `centroids_cache.csv`; all reused on subsequent runs
 2. **Splitline** — Recursive population bisection: find centroid → sweep angles → split on line that best halves population → recurse on each half; alternates between `FIRST_CUT_ANGLE=135°` and `ALT_CUT_ANGLE=45°` as seed angles per depth level
 3. **Border swap** — `N_SWAP_ROUNDS=200` passes of reassigning boundary blocks to neighboring districts to tighten population balance
 4. **Dissolve** — `geopandas` `dissolve()` merges blocks into district polygons

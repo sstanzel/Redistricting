@@ -1,12 +1,12 @@
 """
-Fair Redistricting v12b
-=======================
-Fixes from v12:
-  - pagesize bug fixed: letter aliased as LETTER_SIZE immediately at import,
-    never shadowed by local variables
-  - Checkpoint saving: splitline and border-swap results saved to .npy files
-    so subsequent runs skip straight to map/PDF generation
-  - All other v12 features retained
+Fair Redistricting v13
+======================
+Changes from v12b:
+  - Multi-state data layout: all downloaded inputs go to data/{FIPS}/
+    (zip, extracted blocks/, centroids_cache.csv) — shared across runs,
+    never re-downloaded if present
+  - All generated outputs go to output/redistricting_{STATE}_{VERSION}/
+  - Project root stays clean: only source files tracked by git
 
 Requirements:
     pip install geopandas matplotlib shapely scipy numpy pandas tqdm
@@ -94,7 +94,7 @@ STATE_NAME = "Colorado"
 AUTHOR     = "Steve Stanzel, Boulder CO"
 # ═══════════════════════════════════════════════════════════════
 
-VERSION = "v12b"
+VERSION = "v13"
 
 STATES = {
     "Alabama":        {"fips": "01", "districts": 7},
@@ -268,12 +268,14 @@ else:
     MAX_SPLIT_ERROR = MAX_TOTAL_DEV / MAX_DEPTH
 
 STATE_SLUG = STATE_NAME.replace(" ", "_")
-OUTPUT_DIR = f"redistricting_{STATE_SLUG}_{VERSION}"
-CACHE_CSV  = f"{STATE_FIPS}_{STATE_SLUG}_centroids_cache.csv"
-SHP_DIR    = f"{STATE_FIPS}_blocks"
-ZIP_PATH   = f"tl_2020_{STATE_FIPS}_tabblock20.zip"
+DATA_DIR   = os.path.join("data", STATE_FIPS)
+ZIP_PATH   = os.path.join(DATA_DIR, f"tl_2020_{STATE_FIPS}_tabblock20.zip")
+SHP_DIR    = os.path.join(DATA_DIR, "blocks")
+CACHE_CSV  = os.path.join(DATA_DIR, "centroids_cache.csv")
+OUTPUT_DIR = os.path.join("output", f"redistricting_{STATE_SLUG}_{VERSION}")
 CHECKPOINT = os.path.join(OUTPUT_DIR, f"checkpoint_{STATE_SLUG}.npy")
 
+os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Output paths — all variables, never hardcoded strings

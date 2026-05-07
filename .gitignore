@@ -6,16 +6,11 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Downloaded Census shapefiles (large, re-downloadable)
-*_blocks/
-*.zip
+# Downloaded data and caches (organized by state FIPS under data/)
+data/
 
-# Centroid cache CSVs (generated from shapefiles)
-*_centroids_cache.csv
+# Generated outputs
+output/
 
-# All generated output directories
-redistricting_*/
-redistricting_output/
-
-# Archive of old versions
+# Archive of old versions and runs
 archive/
