@@ -61,7 +61,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.colors as mcolors
 from matplotlib.lines import Line2D
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Point
 from shapely.ops import unary_union
 from pyproj import Transformer
 from PIL import Image as PILImage
@@ -160,8 +160,8 @@ STATE       = STATES[STATE_NAME]
 STATE_FIPS  = STATE["fips"]
 N_DISTRICTS = STATE["districts"]
 
-_cities_df  = pd.read_csv("cities.csv") if os.path.exists("cities.csv") else pd.DataFrame()
-_state_rows = _cities_df[_cities_df["state"] == STATE_NAME] if not _cities_df.empty else pd.DataFrame()
+_cities_df  = pd.read_csv(os.path.join("data", "cities.csv")) if os.path.exists(os.path.join("data", "cities.csv")) else pd.DataFrame()
+_state_rows = _cities_df[_cities_df["state"] == STATE_NAME].head(N_DISTRICTS * 10) if not _cities_df.empty else pd.DataFrame()
 STATE_CITIES = list(zip(_state_rows["city"], _state_rows["lat"], _state_rows["lon"]))
 
 FIRST_CUT_ANGLE = 135.0
@@ -271,10 +271,15 @@ ymin_s,ymax_s = cy_all.min(),cy_all.max()
 log.info(f"  {n_blocks:,} blocks | pop: {total_pop:,} | target: {target_pop:,.0f}")
 
 utm_to_wgs84 = Transformer.from_crs("EPSG:26913","EPSG:4326",always_xy=True)
+wgs84_to_utm = Transformer.from_crs("EPSG:4326","EPSG:26913",always_xy=True)
 
 def utm_to_latlon(utm_x, utm_y):
     lon, lat = utm_to_wgs84.transform(utm_x, utm_y)
     return round(lat,4), round(lon,4)
+
+def latlon_to_utm(lat, lon):
+    x, y = wgs84_to_utm.transform(lon, lat)
+    return x, y
 
 
 # ── Stage 2: Split functions ──────────────────────────────────
@@ -521,21 +526,27 @@ def haversine(lat1,lon1,lat2,lon2):
 
 def nearest_city(utm_x, utm_y):
     lat,lon = utm_to_latlon(utm_x,utm_y)
-    best_d=float('inf'); best_c="Unknown"
+    best_d=float('inf'); best_c="Unknown"; best_clat=lat; best_clon=lon
     for city,clat,clon in STATE_CITIES:
         d=haversine(lat,lon,clat,clon)
-        if d<best_d: best_d=d; best_c=city
-    return best_c, round(best_d,1), lat, lon
+        if d<best_d: best_d=d; best_c=city; best_clat=clat; best_clon=clon
+    return best_c, round(best_d,1), lat, lon, best_clat, best_clon
 
 summary_rows = []
+city_outside_warnings = []
 for d in range(N_DISTRICTS):
     idx=np.where(labels==d)[0]; w=pop_all[idx]
     cx=np.average(cx_all[idx],weights=w)
     cy=np.average(cy_all[idx],weights=w)
-    city,dist_km,lat,lon = nearest_city(cx,cy)
+    city,dist_km,lat,lon,city_lat,city_lon = nearest_city(cx,cy)
+    city_utm_x, city_utm_y = latlon_to_utm(city_lat, city_lon)
+    city_in_district = district_shapes.geometry.loc[d].contains(Point(city_utm_x, city_utm_y))
     ok="✓" if abs(dev_pct[d])<=MAX_TOTAL_DEV*100 else "✗"
+    outside_flag = "" if city_in_district else "  ⚠ city outside district"
     log.info(f"  D{d+1:<3} {pop_stats[d]:>10,} {dev_pct[d]:>+7.3f}%  "
-             f"{city:<22} {dist_km:>5.0f}km  {ok}")
+             f"{city:<22} {dist_km:>5.0f}km  {ok}{outside_flag}")
+    if not city_in_district:
+        city_outside_warnings.append(f"D{d+1}: {city}")
     summary_rows.append({
         "district":d+1, "population":int(pop_stats[d]),
         "deviation_pct":round(float(dev_pct[d]),4),
@@ -543,7 +554,11 @@ for d in range(N_DISTRICTS):
         "pp_compactness":round(float(pp.iloc[d]),4),
         "center_lat":lat, "center_lon":lon,
         "nearest_city":city, "nearest_city_dist_km":dist_km,
+        "city_in_district":city_in_district,
     })
+
+if city_outside_warnings:
+    log.warning(f"  ⚠ Nearest city outside district boundaries: {', '.join(city_outside_warnings)}")
 summary_df = pd.DataFrame(summary_rows)
 
 

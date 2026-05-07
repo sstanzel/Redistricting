@@ -7,7 +7,8 @@ __pycache__/
 *.pyo
 
 # Downloaded data and caches (organized by state FIPS under data/)
-data/
+# Ignore state subdirectories but not data/cities.csv
+data/*/
 
 # Generated outputs
 output/
