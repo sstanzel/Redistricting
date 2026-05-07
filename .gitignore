@@ -16,3 +16,6 @@ __pycache__/
 # All generated output directories
 redistricting_*/
 redistricting_output/
+
+# Archive of old versions
+archive/
