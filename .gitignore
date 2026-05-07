@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Downloaded Census shapefiles (large, re-downloadable)
+*_blocks/
+*.zip
+
+# Centroid cache CSVs (generated from shapefiles)
+*_centroids_cache.csv
+
+# All generated output directories
+redistricting_*/
+redistricting_output/
