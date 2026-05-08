@@ -246,14 +246,16 @@ if not os.path.exists(SHP_DIR):
 shp = [f for f in os.listdir(SHP_DIR) if f.endswith(".shp")][0]
 shp_path = os.path.join(SHP_DIR, shp)
 
-# Determine correct UTM zone from state's geographic center (shapefile is WGS84)
+# Select projection: Albers Equal-Area for contiguous US, UTM for AK/HI
 log.info("  Loading shapefile...")
 gdf = gpd.read_file(shp_path)
-_minx, _miny, _maxx, _maxy = gdf.total_bounds
-_center_lon = (_minx + _maxx) / 2
-_utm_zone = int((_center_lon + 180) / 6) + 1
-UTM_EPSG = 26900 + _utm_zone
-log.info(f"  UTM zone: {_utm_zone} (EPSG:{UTM_EPSG})")
+if STATE_FIPS == "02":    # Alaska
+    UTM_EPSG = 3338       # NAD83 Alaska Albers
+elif STATE_FIPS == "15":  # Hawaii
+    UTM_EPSG = 26904      # NAD83 UTM zone 4N
+else:
+    UTM_EPSG = 5070       # NAD83 Conus Albers Equal-Area
+log.info(f"  Projection: EPSG:{UTM_EPSG}")
 
 gdf = gdf.to_crs(epsg=UTM_EPSG)
 gdf["POP20"] = gdf["POP20"].astype(int)
