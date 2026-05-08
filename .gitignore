@@ -15,3 +15,9 @@ output/
 
 # Archive of old versions and runs
 archive/
+
+# Dev sandbox — exploratory visualization work, not production code
+Dev/
+
+# Claude Code project memory
+.claude/

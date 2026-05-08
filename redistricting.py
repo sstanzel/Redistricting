@@ -51,8 +51,17 @@ if missing:
     sys.exit(1)
 
 # ── Imports ───────────────────────────────────────────────────
-import os, zipfile, urllib.request, logging, math, re
+import argparse
+import colorsys
+import logging
+import math
+import os
+import pickle
+import re
+import urllib.request
+import zipfile
 from datetime import datetime
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -63,6 +72,7 @@ import matplotlib.colors as mcolors
 from matplotlib.lines import Line2D
 from shapely.geometry import LineString, Point
 from shapely.ops import unary_union
+from shapely.wkt import loads as wkt_loads
 from pyproj import Transformer
 from PIL import Image as PILImage
 
@@ -90,7 +100,7 @@ PDF_BLACK = black
 PDF_WHITE = white
 
 # ═══════════════════════════════════════════════════════════════
-STATE_NAME = "Colorado"
+STATE_NAME = "Texas"
 AUTHOR     = "Steve Stanzel, Boulder CO"
 # ═══════════════════════════════════════════════════════════════
 
@@ -173,8 +183,9 @@ STATE_CITIES = list(zip(_state_rows["city"], _state_rows["lat"], _state_rows["lo
 FIRST_CUT_ANGLE = 135.0
 ALT_CUT_ANGLE   = 45.0
 MAX_TOTAL_DEV   = 0.01
-SEARCH_RADIUS   = 45.0
-N_SWAP_ROUNDS   = 200
+SEARCH_RADIUS         = 45.0
+SWAP_ROUNDS_PER_DIST  = 25
+N_SWAP_ROUNDS         = SWAP_ROUNDS_PER_DIST * N_DISTRICTS
 
 if N_DISTRICTS == 1:
     MAX_DEPTH = 1; MAX_SPLIT_ERROR = MAX_TOTAL_DEV
@@ -194,13 +205,14 @@ os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Output paths — all variables, never hardcoded strings
-MAP_PNG      = os.path.join(OUTPUT_DIR, f"districts_{STATE_SLUG}_{VERSION}.png")
-SUMMARY_PNG  = os.path.join(OUTPUT_DIR, f"summary_{STATE_SLUG}_{VERSION}.png")
-BLOCKS_PNG   = os.path.join(OUTPUT_DIR, f"census_blocks_{STATE_SLUG}_{VERSION}.png")
-REPORT_PDF   = os.path.join(OUTPUT_DIR, f"report_{STATE_SLUG}_{VERSION}.pdf")
-CODE_PDF     = os.path.join(OUTPUT_DIR, f"source_code_{STATE_SLUG}_{VERSION}.pdf")
+MAP_PNG        = os.path.join(OUTPUT_DIR, f"districts_{STATE_SLUG}_{VERSION}.png")
+SUMMARY_PNG    = os.path.join(OUTPUT_DIR, f"summary_{STATE_SLUG}_{VERSION}.png")
+COMPLEXITY_PNG = os.path.join(OUTPUT_DIR, f"census_complexity_{STATE_SLUG}_{VERSION}.png")
+BLOCKS_PNG     = os.path.join(OUTPUT_DIR, f"census_blocks_{STATE_SLUG}_{VERSION}.png")
+REPORT_PDF     = os.path.join(OUTPUT_DIR, f"report_{STATE_SLUG}_{VERSION}.pdf")
+CODE_PDF       = os.path.join(OUTPUT_DIR, f"source_code_{STATE_SLUG}_{VERSION}.pdf")
 
-def process_page_path(n):
+def process_page_path(n: int) -> str:
     return os.path.join(OUTPUT_DIR,
         f"process_page{n}_{STATE_SLUG}_{VERSION}.png")
 
@@ -212,6 +224,19 @@ MAP_COLORS = [
 ]
 SPLIT_COLORS = {0:"#C0392B",1:"#E67E22",2:"#27AE60",3:"#8E44AD",4:"#2980B9"}
 SPLIT_WIDTH  = {0:2.8,1:2.2,2:1.8,3:1.4,4:1.2}
+
+# Output DPI — separate values let us tune file size vs. quality per output type
+MAP_DPI     = 150  # district map and summary chart
+BLOCKS_DPI  = 130  # census block explainer (many dots; lower DPI still sharp)
+PROCESS_DPI = 140  # step-by-step process pages
+
+# Census block scatter dot size — small enough not to overlap at state scale
+SCATTER_SIZE = 0.3
+
+# Geographic / geometric constants
+EARTH_RADIUS_KM  = 6371.0  # mean Earth radius for haversine distance
+LINE_EXTEND_M    = 2e6     # half-length (m) for infinite split line before clipping to region
+DISTRICT_SIMPLIFY_M = 5000  # 5 km smoothing applied to district boundaries for display only
 
 # ── Logging ───────────────────────────────────────────────────
 log_path = os.path.join(OUTPUT_DIR,
@@ -231,6 +256,13 @@ log.info("=" * 60)
 if N_DISTRICTS == 1:
     log.info(f"{STATE_NAME} has 1 district — no splitting needed.")
     sys.exit(0)
+
+_parser = argparse.ArgumentParser(prog="redistricting.py")
+_parser.add_argument("--full", action="store_true",
+                     help="Generate full report (process pages, CSVs, PDFs)")
+FULL_REPORT = _parser.parse_args().full
+if not FULL_REPORT:
+    log.info("  Mode: quick  (district map PNG only; use --full for reports)")
 
 
 # ── Stage 1: Load ─────────────────────────────────────────────
@@ -290,35 +322,103 @@ log.info(f"  {n_blocks:,} blocks | pop: {total_pop:,} | target: {target_pop:,.0f
 utm_to_wgs84 = Transformer.from_crs(f"EPSG:{UTM_EPSG}","EPSG:4326",always_xy=True)
 wgs84_to_utm = Transformer.from_crs("EPSG:4326",f"EPSG:{UTM_EPSG}",always_xy=True)
 
-def utm_to_latlon(utm_x, utm_y):
-    lon, lat = utm_to_wgs84.transform(utm_x, utm_y)
-    return round(lat,4), round(lon,4)
+def utm_to_latlon(utm_x: float, utm_y: float) -> tuple[float, float]:
+    """Convert projected coordinates to WGS-84 latitude/longitude.
 
-def latlon_to_utm(lat, lon):
+    Args:
+        utm_x: Easting in the active projection (meters).
+        utm_y: Northing in the active projection (meters).
+
+    Returns:
+        (lat, lon) rounded to 4 decimal places.
+    """
+    lon, lat = utm_to_wgs84.transform(utm_x, utm_y)
+    return round(lat, 4), round(lon, 4)
+
+
+def latlon_to_utm(lat: float, lon: float) -> tuple[float, float]:
+    """Convert WGS-84 latitude/longitude to projected coordinates.
+
+    Args:
+        lat: Latitude in decimal degrees.
+        lon: Longitude in decimal degrees.
+
+    Returns:
+        (x, y) easting/northing in the active projection (meters).
+    """
     x, y = wgs84_to_utm.transform(lon, lat)
     return x, y
 
 
 # ── Stage 2: Split functions ──────────────────────────────────
-def weighted_centroid(indices):
-    w = pop_all[indices]
-    return (np.average(cx_all[indices],weights=w),
-            np.average(cy_all[indices],weights=w))
+def weighted_centroid(indices: np.ndarray) -> tuple[float, float]:
+    """Compute the population-weighted centroid of a set of census blocks.
 
-def balance_at_angle(indices, angle_rad, ax, ay):
-    dx,dy = np.cos(angle_rad),np.sin(angle_rad)
-    signed = (cx_all[indices]-ax)*(-dy)+(cy_all[indices]-ay)*dx
-    lm=signed<=0; rm=~lm
-    pl=pop_all[indices][lm].sum(); pr=pop_all[indices][rm].sum()
-    total=pl+pr
-    err=abs(pl-pr)/total if total>0 else 1.0
-    return lm,rm,err,int(pl),int(pr)
+    Args:
+        indices: Block indices into the global cx_all / cy_all / pop_all arrays.
 
-def goal_seek_angle(indices, ax, ay, seed_angle_deg):
+    Returns:
+        (x, y) centroid in the active projection (meters).
     """
-    Sweep outward from seed_angle_deg in both directions simultaneously.
-    Accept first angle within SEARCH_RADIUS achieving balance <= MAX_SPLIT_ERROR.
-    Fall back to full 180 sweep if needed.
+    w = pop_all[indices]
+    return (np.average(cx_all[indices], weights=w),
+            np.average(cy_all[indices], weights=w))
+
+
+def balance_at_angle(
+    indices: np.ndarray,
+    angle_rad: float,
+    ax: float,
+    ay: float,
+    target_frac: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray, float, int, int]:
+    """Split blocks along a line and measure how close the population ratio is to target.
+
+    Args:
+        indices: Block indices to split.
+        angle_rad: Angle of the split line in radians (0 = east, π/2 = north).
+        ax: X coordinate of the anchor point (population-weighted centroid).
+        ay: Y coordinate of the anchor point.
+        target_frac: Desired fraction of total population on the left side.
+
+    Returns:
+        (left_mask, right_mask, err, pop_left, pop_right) where err is in [0, 1];
+        0 means the split exactly hit target_frac.
+    """
+    dx, dy = np.cos(angle_rad), np.sin(angle_rad)
+    signed = (cx_all[indices] - ax) * (-dy) + (cy_all[indices] - ay) * dx
+    lm = signed <= 0
+    rm = ~lm
+    pl = pop_all[indices][lm].sum()
+    pr = pop_all[indices][rm].sum()
+    total = pl + pr
+    # Normalized to [0, 1]: 0 = perfect split at target_frac, 1 = all on one side
+    err = abs(pl / total - target_frac) * 2 if total > 0 else 1.0
+    return lm, rm, err, int(pl), int(pr)
+
+
+def goal_seek_angle(
+    indices: np.ndarray,
+    ax: float,
+    ay: float,
+    seed_angle_deg: float,
+    target_frac: float = 0.5,
+) -> tuple[float, np.ndarray, np.ndarray, float, tuple[int, int]]:
+    """Find the split-line angle that best achieves the target population ratio.
+
+    Sweeps outward from seed_angle_deg in both directions simultaneously.
+    Accepts the first angle within SEARCH_RADIUS that reaches MAX_SPLIT_ERROR,
+    then falls back to a full 180° sweep if needed.
+
+    Args:
+        indices: Block indices for this sub-region.
+        ax: Anchor X (population-weighted centroid of sub-region).
+        ay: Anchor Y.
+        seed_angle_deg: Starting angle in degrees to sweep from.
+        target_frac: Fraction of population that should go to the left side.
+
+    Returns:
+        (angle_rad, left_mask, right_mask, best_err, (pop_left, pop_right))
     """
     best_err=np.inf; best_angle=np.deg2rad(seed_angle_deg)
     best_left=best_right=None; best_pops=(0,0)
@@ -326,7 +426,7 @@ def goal_seek_angle(indices, ax, ay, seed_angle_deg):
         for sign in ([0] if delta==0 else [1,-1]):
             ang=(seed_angle_deg+sign*delta)%180
             ar=np.deg2rad(ang)
-            lm,rm,err,pl,pr=balance_at_angle(indices,ar,ax,ay)
+            lm,rm,err,pl,pr=balance_at_angle(indices,ar,ax,ay,target_frac)
             if err<best_err:
                 best_err=err; best_angle=ar
                 best_left=lm; best_right=rm; best_pops=(pl,pr)
@@ -335,22 +435,55 @@ def goal_seek_angle(indices, ax, ay, seed_angle_deg):
     log.info(f"    [!] Expanding to full 180° (best: {best_err*100:.3f}%)")
     for deg in range(0,180):
         ar=np.deg2rad(deg)
-        lm,rm,err,pl,pr=balance_at_angle(indices,ar,ax,ay)
+        lm,rm,err,pl,pr=balance_at_angle(indices,ar,ax,ay,target_frac)
         if err<best_err:
             best_err=err; best_angle=ar
             best_left=lm; best_right=rm; best_pops=(pl,pr)
         if err<=MAX_SPLIT_ERROR: break
     return best_angle,best_left,best_right,best_err,best_pops
 
-def make_clipped_line(ax, ay, angle_rad, region_shape):
-    """Extend split line infinitely, clip to sub-region boundary."""
-    dx,dy = np.cos(angle_rad),np.sin(angle_rad)
-    L=2e6
-    full=LineString([(ax-L*dx,ay-L*dy),(ax+L*dx,ay+L*dy)])
-    try: return full.intersection(region_shape)
-    except Exception: return full
+def make_clipped_line(
+    ax: float,
+    ay: float,
+    angle_rad: float,
+    region_shape: Any,
+) -> Any:
+    """Build a split line clipped to a sub-region boundary.
 
-def region_shape_from_indices(indices):
+    Extends the line LINE_EXTEND_M meters in both directions from the anchor
+    point, then clips it to the region polygon so only the visible segment
+    is stored.
+
+    Args:
+        ax: Anchor X coordinate (population-weighted centroid).
+        ay: Anchor Y coordinate.
+        angle_rad: Split-line direction in radians.
+        region_shape: Shapely geometry of the sub-region to clip against.
+
+    Returns:
+        Clipped Shapely geometry (LineString or MultiLineString), or the
+        full unclipped line if intersection raises an exception.
+    """
+    dx, dy = np.cos(angle_rad), np.sin(angle_rad)
+    full = LineString([
+        (ax - LINE_EXTEND_M * dx, ay - LINE_EXTEND_M * dy),
+        (ax + LINE_EXTEND_M * dx, ay + LINE_EXTEND_M * dy),
+    ])
+    try:
+        return full.intersection(region_shape)
+    except Exception:
+        return full
+
+
+def region_shape_from_indices(indices: np.ndarray) -> Any:
+    """Return the dissolved geometry for a subset of census blocks.
+
+    Args:
+        indices: Block indices into the global GeoDataFrame.
+
+    Returns:
+        Shapely geometry (unary union of the selected block polygons).
+    """
     return unary_union(gdf.iloc[indices].geometry.values)
 
 
@@ -364,10 +497,10 @@ if os.path.exists(CHECKPOINT):
     split_log_data = ckpt["split_log_data"]
     log.info(f"  Loaded {len(split_log_data)} splits from checkpoint.")
 
-    # Rebuild split_log entries without geometry (for PDF text/stats only)
-    # Clipped lines will be recomputed for drawing
-    log.info("  Rebuilding split geometries for visualization...")
     gdf["district"] = labels
+    _need_geom_rebuild = any("clipped_wkt" not in sd for sd in split_log_data)
+    if _need_geom_rebuild:
+        log.info("  Rebuilding split geometries (one-time; will cache in checkpoint)...")
 
     split_log = []
     for sd in split_log_data:
@@ -375,18 +508,29 @@ if os.path.exists(CHECKPOINT):
         left_mask = np.isin(np.arange(len(indices)),
                             [i for i,idx in enumerate(indices)
                              if idx in sd["left_indices_set"]])
-        # Recompute clipped line
-        ax,ay = sd["anchor_x"], sd["anchor_y"]
-        ar    = np.deg2rad(sd["angle_deg"])
-        try:
-            region_geom = region_shape_from_indices(indices)
-            clipped = make_clipped_line(ax, ay, ar, region_geom)
-        except Exception:
-            clipped = None
+        wkt = sd.get("clipped_wkt")
+        if wkt:
+            clipped = wkt_loads(wkt)
+        else:
+            ax,ay = sd["anchor_x"], sd["anchor_y"]
+            ar    = np.deg2rad(sd["angle_deg"])
+            try:
+                region_geom = region_shape_from_indices(indices)
+                clipped = make_clipped_line(ax, ay, ar, region_geom)
+            except Exception:
+                clipped = None
         split_log.append({**sd,
                           "indices": indices,
                           "left_mask": left_mask,
                           "clipped_line": clipped})
+
+    if _need_geom_rebuild:
+        for i, (s, sd) in enumerate(zip(split_log, split_log_data)):
+            cl = s["clipped_line"]
+            split_log_data[i]["clipped_wkt"] = cl.wkt if (cl and not cl.is_empty) else None
+        np.save(CHECKPOINT, {"labels": labels, "split_log_data": split_log_data},
+                allow_pickle=True)
+        log.info("  Checkpoint updated with cached geometry.")
     log.info("  Checkpoint loaded successfully.")
 else:
     log.info("[Stage 3] Running population-bisecting splitline")
@@ -408,9 +552,10 @@ else:
         split_num = split_counter[0]
         seed      = FIRST_CUT_ANGLE if split_num%2==0 else ALT_CUT_ANGLE
         split_counter[0] += 1
+        target_frac = n_left_d / n_total  # proportional split, not always 50:50
 
         angle_rad,left_mask,right_mask,err,(pl,pr) = \
-            goal_seek_angle(indices,ax,ay,seed)
+            goal_seek_angle(indices,ax,ay,seed,target_frac)
         angle_deg = np.rad2deg(angle_rad)%180
 
         if region_geom is None:
@@ -455,11 +600,12 @@ else:
     split_log_data = [{k:v for k,v in s.items()
                        if k not in ("indices","left_mask","clipped_line")}
                       for s in split_log]
-    # Also save index arrays for reconstruction
     for i,s in enumerate(split_log):
         split_log_data[i]["indices_list"]    = s["indices"].tolist()
         split_log_data[i]["left_indices_set"] = set(
             s["indices"][s["left_mask"]].tolist())
+        cl = s["clipped_line"]
+        split_log_data[i]["clipped_wkt"] = cl.wkt if (cl and not cl.is_empty) else None
 
     np.save(CHECKPOINT, {"labels": labels,
                           "split_log_data": split_log_data},
@@ -471,10 +617,12 @@ else:
 SWAP_CHECKPOINT = os.path.join(OUTPUT_DIR,
     f"checkpoint_swap_{STATE_SLUG}.npy")
 
+_swap_loaded = False
 if os.path.exists(SWAP_CHECKPOINT):
     log.info(f"[Stage 4] Loading swap checkpoint: {SWAP_CHECKPOINT}")
     labels = np.load(SWAP_CHECKPOINT, allow_pickle=True).item()["labels"]
     gdf["district"] = labels
+    _swap_loaded = True
     log.info("  Loaded.")
 else:
     log.info("[Stage 4] Border-swap post-processing for <1% deviation")
@@ -524,8 +672,17 @@ log.info(f"  After swap: max dev = {max_dev:.4f}% | {result}")
 
 
 # ── Stage 5: Dissolve ─────────────────────────────────────────
-log.info("[Stage 5] Dissolving district shapes...")
-district_shapes = gdf.dissolve(by="district")
+DISSOLVE_CACHE = os.path.join(OUTPUT_DIR, f"checkpoint_dissolve_{STATE_SLUG}.pkl")
+if _swap_loaded and os.path.exists(DISSOLVE_CACHE):
+    log.info("[Stage 5] Loading cached district shapes...")
+    with open(DISSOLVE_CACHE, "rb") as _f:
+        district_shapes = pickle.load(_f)
+else:
+    log.info("[Stage 5] Dissolving district shapes...")
+    district_shapes = gdf.dissolve(by="district")
+    with open(DISSOLVE_CACHE, "wb") as _f:
+        pickle.dump(district_shapes, _f)
+    log.info("  Dissolve cache saved.")
 hull = district_shapes.geometry.convex_hull
 pp   = 4*np.pi*hull.area/hull.length**2
 log.info(f"  Avg compactness: {pp.mean():.3f}")
@@ -534,20 +691,51 @@ log.info(f"  Avg compactness: {pp.mean():.3f}")
 # ── Stage 6: City lookup ──────────────────────────────────────
 log.info("[Stage 6] Nearest city lookup")
 
-def haversine(lat1,lon1,lat2,lon2):
-    R=6371
-    phi1,phi2=math.radians(lat1),math.radians(lat2)
-    dphi=math.radians(lat2-lat1); dlam=math.radians(lon2-lon1)
-    a=math.sin(dphi/2)**2+math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
-    return 2*R*math.asin(math.sqrt(a))
+def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Compute the great-circle distance between two points in kilometers.
 
-def nearest_city(utm_x, utm_y):
-    lat,lon = utm_to_latlon(utm_x,utm_y)
-    best_d=float('inf'); best_c="Unknown"; best_clat=lat; best_clon=lon
-    for city,clat,clon in STATE_CITIES:
-        d=haversine(lat,lon,clat,clon)
-        if d<best_d: best_d=d; best_c=city; best_clat=clat; best_clon=clon
-    return best_c, round(best_d,1), lat, lon, best_clat, best_clon
+    Args:
+        lat1: Latitude of the first point in decimal degrees.
+        lon1: Longitude of the first point in decimal degrees.
+        lat2: Latitude of the second point in decimal degrees.
+        lon2: Longitude of the second point in decimal degrees.
+
+    Returns:
+        Distance in kilometers.
+    """
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(a))
+
+
+def nearest_city(
+    utm_x: float,
+    utm_y: float,
+) -> tuple[str, float, float, float, float, float]:
+    """Find the closest city to a projected coordinate point.
+
+    Args:
+        utm_x: Easting in the active projection (meters).
+        utm_y: Northing in the active projection (meters).
+
+    Returns:
+        (city_name, distance_km, point_lat, point_lon, city_lat, city_lon)
+    """
+    lat, lon = utm_to_latlon(utm_x, utm_y)
+    best_d = float("inf")
+    best_c = "Unknown"
+    best_clat = lat
+    best_clon = lon
+    for city, clat, clon in STATE_CITIES:
+        d = haversine(lat, lon, clat, clon)
+        if d < best_d:
+            best_d = d
+            best_c = city
+            best_clat = clat
+            best_clon = clon
+    return best_c, round(best_d, 1), lat, lon, best_clat, best_clon
 
 summary_rows = []
 city_outside_warnings = []
@@ -580,56 +768,176 @@ summary_df = pd.DataFrame(summary_rows)
 
 
 # ── Drawing helpers ───────────────────────────────────────────
-def set_state_bounds(ax, pad=15000):
-    ax.set_xlim(xmin_s-pad, xmax_s+pad)
-    ax.set_ylim(ymin_s-pad, ymax_s+pad)
+def set_state_bounds(ax: Any, pad: float = 15000) -> None:
+    ax.set_xlim(xmin_s - pad, xmax_s + pad)
+    ax.set_ylim(ymin_s - pad, ymax_s + pad)
     ax.set_axis_off()
 
-def draw_clipped_splits(ax, splits):
-    for s in splits:
-        col=SPLIT_COLORS.get(s["level"],"#555")
-        wid=SPLIT_WIDTH.get(s["level"],1.0)
-        line=s["clipped_line"]
-        if line is None or line.is_empty: continue
-        geoms=[line] if line.geom_type=="LineString" else list(line.geoms)
-        for g in geoms:
-            if g.geom_type!="LineString": continue
-            xs,ys=g.xy
-            ax.plot(xs,ys,color=col,linewidth=wid*1.8,
-                    linestyle="--",alpha=0.92,zorder=6)
-        ax.plot(s["anchor_x"],s["anchor_y"],"o",color=col,markersize=8,
-                zorder=7,markeredgecolor="white",markeredgewidth=1.5)
 
-def draw_region_labels(ax, s, fontsize=11):
-    for idx_set,pop_val in [
-        (s["indices"][s["left_mask"]],  s["pop_left"]),
+def draw_clipped_splits(ax: Any, splits: list[dict]) -> None:
+    for s in splits:
+        col = SPLIT_COLORS.get(s["level"], "#555")
+        wid = SPLIT_WIDTH.get(s["level"], 1.0)
+        line = s["clipped_line"]
+        if line is None or line.is_empty:
+            continue
+        geoms = [line] if line.geom_type == "LineString" else list(line.geoms)
+        for g in geoms:
+            if g.geom_type != "LineString":
+                continue
+            xs, ys = g.xy
+            ax.plot(xs, ys, color=col, linewidth=wid * 1.8,
+                    linestyle="--", alpha=0.92, zorder=6)
+        ax.plot(s["anchor_x"], s["anchor_y"], "o", color=col, markersize=8,
+                zorder=7, markeredgecolor="white", markeredgewidth=1.5)
+
+
+def draw_region_labels(ax: Any, s: dict, fontsize: int = 11) -> None:
+    for idx_set, pop_val in [
+        (s["indices"][s["left_mask"]],   s["pop_left"]),
         (s["indices"][~s["left_mask"]], s["pop_right"]),
     ]:
-        if len(idx_set)==0: continue
-        w=pop_all[idx_set]
-        lx=np.average(cx_all[idx_set],weights=w)
-        ly=np.average(cy_all[idx_set],weights=w)
-        ax.annotate(f"{pop_val/1000:.0f}k",(lx,ly),
-                    ha="center",va="center",fontsize=fontsize,fontweight="500",
-                    bbox=dict(boxstyle="round,pad=0.4",facecolor="white",
-                              alpha=0.90,edgecolor="#AAAAAA",linewidth=0.5),zorder=9)
+        if len(idx_set) == 0:
+            continue
+        w = pop_all[idx_set]
+        lx = np.average(cx_all[idx_set], weights=w)
+        ly = np.average(cy_all[idx_set], weights=w)
+        ax.annotate(f"{pop_val / 1000:.0f}k", (lx, ly),
+                    ha="center", va="center", fontsize=fontsize, fontweight="500",
+                    bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
+                              alpha=0.90, edgecolor="#AAAAAA", linewidth=0.5), zorder=9)
 
-def split_legend_handles(include_dot=True):
-    levels=sorted(set(s["level"] for s in split_log))
-    handles=[Line2D([0],[0],color=SPLIT_COLORS.get(l,"#555"),
-                    linewidth=SPLIT_WIDTH.get(l,1)*1.8,linestyle="--",
-                    label=f"Level {l} cuts") for l in levels]
+
+def split_legend_handles(include_dot: bool = True) -> list:
+    levels = sorted(set(s["level"] for s in split_log))
+    handles = [
+        Line2D([0], [0], color=SPLIT_COLORS.get(l, "#555"),
+               linewidth=SPLIT_WIDTH.get(l, 1) * 1.8, linestyle="--",
+               label=f"Level {l} cuts")
+        for l in levels
+    ]
     if include_dot:
-        handles.append(Line2D([0],[0],marker="o",color="w",
-                               markerfacecolor="#555555",markersize=9,
-                               markeredgecolor="white",markeredgewidth=1.2,
+        handles.append(Line2D([0], [0], marker="o", color="w",
+                               markerfacecolor="#555555", markersize=9,
+                               markeredgecolor="white", markeredgewidth=1.2,
                                label="● Population center of sub-region\n"
                                      "  (bisection anchor point)"))
     return handles
 
 
+# ── Stage 8: Final district map ───────────────────────────────
+log.info("[Stage 8] Final district map...")
+
+# Per-block scatter: vivid district colour, global alpha so dense metros glow
+# in their district hue rather than blowing out toward white.
+# Zero-population blocks skipped entirely. Blocks sorted ascending by population
+# so the densest marks render last and sit on top — natural density highlighting.
+def _vivid(hex_color: str) -> tuple[float, float, float]:
+    """Return a dark-background-safe version of hex_color.
+
+    Pastels and near-grays in MAP_COLORS suit light backgrounds but wash out
+    on dark ones. Boosting saturation to ≥0.75 and value to ≥0.80 makes every
+    district colour vivid without changing its hue.
+    """
+    h, s, v = colorsys.rgb_to_hsv(*mcolors.to_rgb(hex_color))
+    return colorsys.hsv_to_rgb(h, max(s, 0.75), max(v, 0.80))
+
+_district_rgb = np.array([_vivid(MAP_COLORS[d % len(MAP_COLORS)]) for d in range(N_DISTRICTS)])
+
+# Per-block scatter matching Stage 7b's sub-pixel dot approach, but coloured by
+# district instead of a heat scale.
+# Key: steep gamma (3.5) on brightness means only the top ~20% of blocks by
+# population produce visible light — identical principle to Stage 7b where the
+# YlOrRd colormap maps low-pop blocks to near-black.
+_pop_mask   = pop_all > 0
+_scat_idx   = np.where(_pop_mask)[0]
+_scat_order = _scat_idx[np.argsort(pop_all[_scat_idx])]  # low-pop first, high-pop on top
+
+_s_logp   = np.log10(pop_all[_scat_order])
+_s_norm   = (_s_logp - _s_logp.min()) / max(_s_logp.max() - _s_logp.min(), 1e-9)
+_s_bright = np.clip(_s_norm, 0, 1) ** 3.5   # steep: sparse blocks near-black, dense cores vivid
+_scat_rgb = _district_rgb[labels[_scat_order]] * _s_bright[:, np.newaxis]
+
+# Simplified district shapes — smooths census-block-edge jaggedness for display.
+# Block assignments (block_assignments_*.csv) still reflect the exact unsimplified
+# geometry used for population counts.
+_simp_geom = district_shapes.geometry.simplify(DISTRICT_SIMPLIFY_M, preserve_topology=True)
+_simp_shapes = district_shapes.copy()
+_simp_shapes.geometry = _simp_geom
+# State outer hull from unsimplified geometry — adjacent districts share exact
+# edges there, so union_all() produces no interior gaps and boundary() returns
+# only the outer perimeter of the state.
+_state_outer = district_shapes.geometry.union_all()
+_state_gs = gpd.GeoSeries([_state_outer], crs=district_shapes.crs)
+
+MAP_BG = "#0D1117"
+
+fig, ax = plt.subplots(1, 1, figsize=(16, 10))
+fig.patch.set_facecolor(MAP_BG)
+ax.set_facecolor(MAP_BG)
+
+# Sub-pixel scatter: district colour, brightness by steep gamma → matches Stage 7b aesthetics.
+ax.scatter(cx_all[_scat_order], cy_all[_scat_order],
+           c=_scat_rgb, s=SCATTER_SIZE, alpha=0.6, linewidths=0, zorder=4)
+
+# Odd districts (D1, D3, D5 …) draw their boundary in district colour.
+# Even districts draw no line, so every shared border between an odd and even
+# district carries exactly one coloured line — avoiding the doubled-line noise
+# that would appear if every district drew its own boundary.
+for d in range(N_DISTRICTS):
+    if d % 2 == 0 and d in _simp_shapes.index:  # d is 0-based: 0,2,4… = D1,D3,D5…
+        _simp_shapes.loc[[d]].boundary.plot(
+            ax=ax, color=MAP_COLORS[d % len(MAP_COLORS)], linewidth=1.2, zorder=6
+        )
+
+# State outer boundary anchors the shape against the dark background.
+_state_gs.boundary.plot(ax=ax, color="white", linewidth=2.0, zorder=7)
+
+# District labels: white text, dark semi-transparent pill.
+for d in range(N_DISTRICTS):
+    if d in _simp_shapes.index:
+        c = _simp_shapes.loc[d].geometry.centroid
+        ax.annotate(
+            f"D{d+1} · {summary_rows[d]['nearest_city']}",
+            (c.x, c.y), ha="center", va="center", fontsize=6.5, fontweight="500",
+            color="white",
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="#1A1A2E",
+                      alpha=0.75, edgecolor="none"), zorder=9)
+
+ax.set_title(
+    f"{STATE_NAME} — {N_DISTRICTS} Districts ({APPORTIONMENT_YEAR} apportionment)\n"
+    f"Population-Bisecting Splitline {VERSION}  ·  "
+    f"Color = District  ·  Brightness = population density  ·  Odd districts outlined",
+    fontsize=12, fontweight="500", color="white", pad=12)
+set_state_bounds(ax)
+
+plt.suptitle(
+    f"{STATE_NAME} Fair Redistricting {VERSION}  |  "
+    f"Pop: {total_pop:,}  |  Target: {target_pop:,.0f}/district  |  "
+    f"Max deviation: {max_dev:.4f}%  |  {result}",
+    fontsize=11, fontweight="500", color="white", y=1.01)
+plt.tight_layout()
+plt.savefig(MAP_PNG, dpi=MAP_DPI, bbox_inches="tight", facecolor=fig.get_facecolor())
+plt.close()
+log.info(f"  Saved: {MAP_PNG}")
+
+
+
+# ── Quick-mode exit ──────────────────────────────────────────
+if not FULL_REPORT:
+    log.info("=" * 60)
+    log.info(f"Done — {STATE_NAME} {VERSION}")
+    log.info(f"  Prepared by:     {AUTHOR}")
+    log.info(f"  Districts:       {N_DISTRICTS}")
+    log.info(f"  Max deviation:   {max_dev:.4f}% | {result}")
+    log.info(f"  Avg compactness: {pp.mean():.3f}")
+    log.info(f"  District map:    {MAP_PNG}")
+    log.info("=" * 60)
+    sys.exit(0)
+
+
 # ── Stage 7: Census block explainer ───────────────────────────
-log.info("[Stage 7] Census block explainer map...")
+log.info("[Stage 7] Census block explainer...")
 gdf["area_sqkm"] = gdf["ALAND20"] / 1e6
 block_areas = gdf["area_sqkm"].values
 block_pops  = gdf["POP20"].values
@@ -646,206 +954,204 @@ blk_stats = {
     "pop_median":  float(np.median(block_pops)),
 }
 
-# Inset boxes (UTM coords)
-DEN_X0,DEN_X1,DEN_Y0,DEN_Y1 = 488000,528000,4380000,4420000
-COS_X0,COS_X1,COS_Y0,COS_Y1 = 508000,536000,4280000,4310000
-RUR_X0,RUR_X1,RUR_Y0,RUR_Y1 = 700000,760000,4330000,4390000
+# ── Stage 7a: Census block complexity map ─────────────────────
+# Draw every census block as a faint white outline on a dark background.
+# In cities where blocks are tiny and packed, thousands of outlines overlap
+# and the area glows white.  In rural areas the few large blocks barely show.
+# This map is ONLY about data structure — no district colors, no population.
+if os.path.exists(COMPLEXITY_PNG):
+    log.info(f"  [7a] Using cached: {COMPLEXITY_PNG}")
+else:
+    log.info(f"  [7a] Building census block complexity map ({n_blocks:,} blocks)...")
+    fig_cx, ax_cx = plt.subplots(figsize=(16, 10))
+    fig_cx.patch.set_facecolor("#1A1A2E")
+    ax_cx.set_facecolor("#1A1A2E")
+    gdf.plot(ax=ax_cx, facecolor="none", edgecolor="white",
+             linewidth=0.08, alpha=0.06)
+    ax_cx.set_title(
+        f"{STATE_NAME} — {n_blocks:,} Census Block Boundaries\n"
+        "Each line is one block edge  ·  Lines stack in cities to reveal density",
+        fontsize=14, fontweight="500", color="white", pad=10)
+    set_state_bounds(ax_cx, pad=20000)
+    plt.tight_layout()
+    fig_cx.savefig(COMPLEXITY_PNG, dpi=BLOCKS_DPI, bbox_inches="tight",
+                   facecolor=fig_cx.get_facecolor())
+    plt.close()
+    log.info(f"  Saved: {COMPLEXITY_PNG}")
 
-fig_b,ax_b = plt.subplots(figsize=(16,10))
-fig_b.patch.set_facecolor("#1A1A2E"); ax_b.set_facecolor("#1A1A2E")
-pop_vals = np.clip(gdf["POP20"].values,1,None)
-log_pop  = np.log10(pop_vals)
-norm_b   = mcolors.Normalize(vmin=log_pop.min(),vmax=log_pop.max())
-cmap_b   = plt.cm.YlOrRd
-ax_b.scatter(gdf["cx"].values,gdf["cy"].values,
-             c=log_pop,cmap=cmap_b,norm=norm_b,
-             s=0.3,alpha=0.6,linewidths=0,zorder=2)
+# ── Stage 7b: Population density map ─────────────────────────
+if os.path.exists(BLOCKS_PNG):
+    log.info(f"  [7b] Using cached: {BLOCKS_PNG}")
+else:
+    log.info(f"  [7b] Building population density map...")
 
-inset_defs_main = [
-    (DEN_X0,DEN_Y0,DEN_X1,DEN_Y1,"Denver Metro","A","#00D4FF"),
-    (COS_X0,COS_Y0,COS_X1,COS_Y1,"Colorado Springs","B","#FFD700"),
-    (RUR_X0,RUR_Y0,RUR_X1,RUR_Y1,"Eastern Plains","C","#98FF98"),
-]
-for (x0,y0,x1,y1,lbl,letter,col) in inset_defs_main:
-    rect=mpatches.Rectangle((x0,y0),x1-x0,y1-y0,
-        linewidth=2,edgecolor=col,facecolor="none",zorder=8)
-    ax_b.add_patch(rect)
-    ax_b.annotate(f"[{letter}] {lbl}",(x0+(x1-x0)/2,y1+8000),
-                  ha="center",va="bottom",fontsize=9,
-                  color=col,fontweight="bold",zorder=9)
+    # Auto-pick three inset areas: big city, mid-size city, rural
+    _sw = xmax_s - xmin_s
+    _sh = ymax_s - ymin_s
+    _uhw = _sw * 0.03
+    _rhw = _sw * 0.07
 
-sm_b=plt.cm.ScalarMappable(cmap=cmap_b,norm=norm_b); sm_b.set_array([])
-cbar_b=fig_b.colorbar(sm_b,ax=ax_b,shrink=0.5,pad=0.01,
-                       label="Population (log scale)")
-cbar_b.set_ticks([1,2,3,4])
-cbar_b.set_ticklabels(["10","100","1,000","10,000"])
-cbar_b.ax.yaxis.label.set_color("white")
-cbar_b.ax.tick_params(colors="white")
-ax_b.set_title(
-    f"{STATE_NAME} — All {blk_stats['n_blocks']:,} Census Blocks\n"
-    "Each dot = one block, colored by population (brighter = more people)",
-    fontsize=14,fontweight="500",color="white",pad=10)
-set_state_bounds(ax_b,pad=20000)
+    _city_utms = []
+    for _ic, _ilat, _ilon in STATE_CITIES[:min(30, len(STATE_CITIES))]:
+        _iux, _iuy = latlon_to_utm(_ilat, _ilon)
+        _city_utms.append((_ic, _iux, _iuy))
 
-stats_text=(
-    f"Census Block Summary\n{'─'*26}\n"
-    f"Total blocks: {blk_stats['n_blocks']:>8,}\n"
-    f"Total pop:    {blk_stats['total_pop']:>8,}\n\n"
-    f"Area (km²)\n"
-    f" Min:    {blk_stats['area_min']:>8.4f}\n"
-    f" Median: {blk_stats['area_median']:>8.2f}\n"
-    f" Mean:   {blk_stats['area_mean']:>8.2f}\n"
-    f" Max:    {blk_stats['area_max']:>8.0f}\n\n"
-    f"Population\n"
-    f" Min:    {blk_stats['pop_min']:>8,}\n"
-    f" Median: {blk_stats['pop_median']:>8.0f}\n"
-    f" Mean:   {blk_stats['pop_mean']:>8.1f}\n"
-    f" Max:    {blk_stats['pop_max']:>8,}"
-)
-ax_b.text(0.02,0.02,stats_text,transform=ax_b.transAxes,
-          fontsize=8,verticalalignment="bottom",fontfamily="monospace",
-          color="white",
-          bbox=dict(boxstyle="round,pad=0.6",facecolor="#0D1B2A",
-                    alpha=0.88,edgecolor="#444"))
-plt.tight_layout(rect=[0,0,0.88,1])
+    _A_name, _A_x, _A_y = _city_utms[0]
+    _B_name, _B_x, _B_y = _city_utms[min(1, len(_city_utms) - 1)]
+    for _ic, _iux, _iuy in _city_utms[1:]:
+        if math.sqrt((_iux - _A_x) ** 2 + (_iuy - _A_y) ** 2) > _sw * 0.20:
+            _B_name, _B_x, _B_y = _ic, _iux, _iuy
+            break
 
-blocks_main_tmp = os.path.join(OUTPUT_DIR,"blocks_main_tmp.png")
-fig_b.savefig(blocks_main_tmp,dpi=130,bbox_inches="tight",
-              facecolor=fig_b.get_facecolor())
-plt.close()
+    _all_cux = [x for _, x, _ in _city_utms]
+    _all_cuy = [y for _, _, y in _city_utms]
+    _best_rd = 0
+    _R_x, _R_y = (xmin_s + xmax_s) / 2, (ymin_s + ymax_s) / 2
+    for _gi in range(25):
+        for _gj in range(20):
+            _gx = xmin_s + (_gi + 0.5) * _sw / 25
+            _gy = ymin_s + (_gj + 0.5) * _sh / 20
+            _md = min(math.sqrt((_gx - _cx) ** 2 + (_gy - _cy) ** 2)
+                      for _cx, _cy in zip(_all_cux, _all_cuy))
+            if _md > _best_rd:
+                _best_rd = _md
+                _R_x, _R_y = _gx, _gy
 
-fig_b2,axes_b2=plt.subplots(1,3,figsize=(16,5))
-fig_b2.patch.set_facecolor("#1A1A2E")
-inset_detail=[
-    (DEN_X0,DEN_Y0,DEN_X1,DEN_Y1,"[A] Denver Metro","#00D4FF"),
-    (COS_X0,COS_Y0,COS_X1,COS_Y1,"[B] Colorado Springs","#FFD700"),
-    (RUR_X0,RUR_Y0,RUR_X1,RUR_Y1,"[C] Eastern Plains","#98FF98"),
-]
-for ax_i,(x0,y0,x1,y1,ititle,icol) in zip(axes_b2,inset_detail):
-    ax_i.set_facecolor("#0D1B2A")
-    imask=(gdf["cx"]>=x0)&(gdf["cx"]<=x1)&(gdf["cy"]>=y0)&(gdf["cy"]<=y1)
-    isub=gdf[imask]
-    if len(isub)>0:
-        ilp=np.log10(np.clip(isub["POP20"].values,1,None))
-        inorm=mcolors.Normalize(vmin=ilp.min(),vmax=max(ilp.max(),2))
-        for geom,ip in zip(isub.geometry,ilp):
-            try:
-                xs2,ys2=geom.exterior.xy
-                ax_i.fill(xs2,ys2,color=cmap_b(inorm(ip)),alpha=0.8)
-                ax_i.plot(xs2,ys2,color="#333333",linewidth=0.2,alpha=0.5)
-            except Exception: pass
-        for _,rs in isub.nlargest(3,"POP20").iterrows():
-            ax_i.annotate(
-                f"Pop: {int(rs['POP20']):,}\n{rs['area_sqkm']:.2f} km²",
-                (rs["cx"],rs["cy"]),ha="center",va="center",fontsize=7,
-                color="white",fontweight="bold",
-                bbox=dict(boxstyle="round,pad=0.2",facecolor="#000",
-                          alpha=0.7,edgecolor="none"),zorder=10)
-        ax_i.set_title(
-            f"{ititle}\n{len(isub):,} blocks | "
-            f"{int(isub['POP20'].sum()):,} people | "
-            f"median {np.median(isub['area_sqkm']):.2f} km²",
-            fontsize=9,color="white",fontweight="500",pad=6)
-    ax_i.set_xlim(x0,x1); ax_i.set_ylim(y0,y1)
-    for spine in ax_i.spines.values():
-        spine.set_edgecolor(icol); spine.set_linewidth(2)
-    ax_i.set_xticks([]); ax_i.set_yticks([])
+    def _clamp_box(cx, cy, hw):
+        pad = hw * 0.1
+        return (max(xmin_s + pad, cx - hw), min(xmax_s - pad, cx + hw),
+                max(ymin_s + pad, cy - hw), min(ymax_s - pad, cy + hw))
 
-plt.suptitle(
-    "Inset Detail: Urban Density vs Rural Sparsity — same data, different scales",
-    fontsize=11,color="white",fontweight="500",y=1.02)
-plt.tight_layout()
-blocks_insets_tmp = os.path.join(OUTPUT_DIR,"blocks_insets_tmp.png")
-fig_b2.savefig(blocks_insets_tmp,dpi=130,bbox_inches="tight",
-               facecolor=fig_b2.get_facecolor())
-plt.close()
+    A_X0, A_X1, A_Y0, A_Y1 = _clamp_box(_A_x, _A_y, _uhw)
+    B_X0, B_X1, B_Y0, B_Y1 = _clamp_box(_B_x, _B_y, _uhw)
+    R_X0, R_X1, R_Y0, R_Y1 = _clamp_box(_R_x, _R_y, _rhw)
+    log.info(f"  Insets: [A] {_A_name}  [B] {_B_name}  [C] Rural area")
 
-img_main   = PILImage.open(blocks_main_tmp)
-img_insets = PILImage.open(blocks_insets_tmp)
-w_combined = max(img_main.width,img_insets.width)
-combined   = PILImage.new("RGB",(w_combined,img_main.height+img_insets.height),
-                           "#1A1A2E")
-combined.paste(img_main,(0,0))
-combined.paste(img_insets,(0,img_main.height))
-combined.save(BLOCKS_PNG)
-os.remove(blocks_main_tmp); os.remove(blocks_insets_tmp)
-log.info(f"  Saved: {BLOCKS_PNG}")
+    fig_b, ax_b = plt.subplots(figsize=(16, 10))
+    fig_b.patch.set_facecolor("#1A1A2E")
+    ax_b.set_facecolor("#1A1A2E")
+    pop_vals = np.clip(gdf["POP20"].values, 1, None)
+    log_pop  = np.log10(pop_vals)
+    norm_b   = mcolors.Normalize(vmin=log_pop.min(), vmax=log_pop.max())
+    cmap_b   = plt.cm.YlOrRd
+    ax_b.scatter(gdf["cx"].values, gdf["cy"].values,
+                 c=log_pop, cmap=cmap_b, norm=norm_b,
+                 s=SCATTER_SIZE, alpha=0.6, linewidths=0, zorder=2)
 
+    inset_defs_main = [
+        (A_X0, A_Y0, A_X1, A_Y1, _A_name, "A", "#00D4FF"),
+        (B_X0, B_Y0, B_X1, B_Y1, _B_name, "B", "#FFD700"),
+        (R_X0, R_Y0, R_X1, R_Y1, "Rural Area", "C", "#98FF98"),
+    ]
+    for (x0, y0, x1, y1, lbl, letter, col) in inset_defs_main:
+        rect = mpatches.Rectangle((x0, y0), x1 - x0, y1 - y0,
+                                   linewidth=2, edgecolor=col, facecolor="none", zorder=8)
+        ax_b.add_patch(rect)
+        ax_b.annotate(f"[{letter}] {lbl}", (x0 + (x1 - x0) / 2, y1 + _uhw * 0.2),
+                      ha="center", va="bottom", fontsize=9,
+                      color=col, fontweight="bold", zorder=9)
 
-# ── Stage 8: Final district map ───────────────────────────────
-log.info("[Stage 8] Final district map...")
-fig,axes=plt.subplots(1,2,figsize=(22,10))
-fig.patch.set_facecolor("#F8F8F5")
+    sm_b = plt.cm.ScalarMappable(cmap=cmap_b, norm=norm_b)
+    sm_b.set_array([])
+    cbar_b = fig_b.colorbar(sm_b, ax=ax_b, shrink=0.5, pad=0.01,
+                             label="Population (log scale)")
+    cbar_b.set_ticks([1, 2, 3, 4])
+    cbar_b.set_ticklabels(["10", "100", "1,000", "10,000"])
+    cbar_b.ax.yaxis.label.set_color("white")
+    cbar_b.ax.tick_params(colors="white")
+    ax_b.set_title(
+        f"{STATE_NAME} — All {blk_stats['n_blocks']:,} Census Blocks\n"
+        "Each dot = one block, colored by population (brighter = more people)",
+        fontsize=14, fontweight="500", color="white", pad=10)
+    set_state_bounds(ax_b, pad=20000)
 
-ax=axes[0]; ax.set_facecolor("#D6EAF8")
-for d in range(N_DISTRICTS):
-    if d in district_shapes.index:
-        district_shapes.loc[[d]].plot(ax=ax,color=MAP_COLORS[d%len(MAP_COLORS)],
-                                       linewidth=0,alpha=0.90)
-district_shapes.boundary.plot(ax=ax,color="white",linewidth=1.8)
-draw_clipped_splits(ax,split_log)
+    stats_text = (
+        f"Census Block Summary\n{'─' * 26}\n"
+        f"Total blocks: {blk_stats['n_blocks']:>8,}\n"
+        f"Total pop:    {blk_stats['total_pop']:>8,}\n\n"
+        f"Area (km²)\n"
+        f" Min:    {blk_stats['area_min']:>8.4f}\n"
+        f" Median: {blk_stats['area_median']:>8.2f}\n"
+        f" Mean:   {blk_stats['area_mean']:>8.2f}\n"
+        f" Max:    {blk_stats['area_max']:>8.0f}\n\n"
+        f"Population\n"
+        f" Min:    {blk_stats['pop_min']:>8,}\n"
+        f" Median: {blk_stats['pop_median']:>8.0f}\n"
+        f" Mean:   {blk_stats['pop_mean']:>8.1f}\n"
+        f" Max:    {blk_stats['pop_max']:>8,}"
+    )
+    ax_b.text(0.02, 0.02, stats_text, transform=ax_b.transAxes,
+              fontsize=8, verticalalignment="bottom", fontfamily="monospace",
+              color="white",
+              bbox=dict(boxstyle="round,pad=0.6", facecolor="#0D1B2A",
+                        alpha=0.88, edgecolor="#444"))
+    plt.tight_layout(rect=[0, 0, 0.88, 1])
 
-for d in range(N_DISTRICTS):
-    if d in district_shapes.index:
-        c=district_shapes.loc[d].geometry.centroid
-        row=summary_rows[d]
-        ax.annotate(
-            f"D{d+1}  {pop_stats[d]/1000:.0f}k\n"
-            f"{dev_pct[d]:+.2f}%\n★ {row['nearest_city']}",
-            (c.x,c.y),ha="center",va="center",fontsize=7,fontweight="500",
-            bbox=dict(boxstyle="round,pad=0.3",facecolor="white",
-                      alpha=0.88,edgecolor="none"),zorder=10)
+    blocks_main_tmp = os.path.join(OUTPUT_DIR, "blocks_main_tmp.png")
+    fig_b.savefig(blocks_main_tmp, dpi=BLOCKS_DPI, bbox_inches="tight",
+                  facecolor=fig_b.get_facecolor())
+    plt.close()
 
-for d in range(N_DISTRICTS):
-    idx=np.where(labels==d)[0]; w=pop_all[idx]
-    cx=np.average(cx_all[idx],weights=w); cy=np.average(cy_all[idx],weights=w)
-    ax.plot(cx,cy,"*",color=MAP_COLORS[d%len(MAP_COLORS)],markersize=11,
-            zorder=11,markeredgecolor="white",markeredgewidth=1)
+    fig_b2, axes_b2 = plt.subplots(1, 3, figsize=(16, 5))
+    fig_b2.patch.set_facecolor("#1A1A2E")
+    inset_detail = [
+        (A_X0, A_Y0, A_X1, A_Y1, f"[A] {_A_name}", "#00D4FF"),
+        (B_X0, B_Y0, B_X1, B_Y1, f"[B] {_B_name}", "#FFD700"),
+        (R_X0, R_Y0, R_X1, R_Y1, "[C] Rural Area",  "#98FF98"),
+    ]
+    for ax_i, (x0, y0, x1, y1, ititle, icol) in zip(axes_b2, inset_detail):
+        ax_i.set_facecolor("#0D1B2A")
+        imask = (gdf["cx"] >= x0) & (gdf["cx"] <= x1) & (gdf["cy"] >= y0) & (gdf["cy"] <= y1)
+        isub = gdf[imask]
+        if len(isub) > 0:
+            ilp   = np.log10(np.clip(isub["POP20"].values, 1, None))
+            inorm = mcolors.Normalize(vmin=ilp.min(), vmax=max(ilp.max(), 2))
+            for geom, ip in zip(isub.geometry, ilp):
+                try:
+                    xs2, ys2 = geom.exterior.xy
+                    ax_i.fill(xs2, ys2, color=cmap_b(inorm(ip)), alpha=0.8)
+                    ax_i.plot(xs2, ys2, color="#333333", linewidth=0.2, alpha=0.5)
+                except Exception:
+                    pass
+            for _, rs in isub.nlargest(3, "POP20").iterrows():
+                ax_i.annotate(
+                    f"Pop: {int(rs['POP20']):,}\n{rs['area_sqkm']:.2f} km²",
+                    (rs["cx"], rs["cy"]), ha="center", va="center", fontsize=7,
+                    color="white", fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="#000",
+                              alpha=0.7, edgecolor="none"), zorder=10)
+            ax_i.set_title(
+                f"{ititle}\n{len(isub):,} blocks | "
+                f"{int(isub['POP20'].sum()):,} people | "
+                f"median {np.median(isub['area_sqkm']):.2f} km²",
+                fontsize=9, color="white", fontweight="500", pad=6)
+        ax_i.set_xlim(x0, x1)
+        ax_i.set_ylim(y0, y1)
+        for spine in ax_i.spines.values():
+            spine.set_edgecolor(icol)
+            spine.set_linewidth(2)
+        ax_i.set_xticks([])
+        ax_i.set_yticks([])
 
-leg_d=[mpatches.Patch(facecolor=MAP_COLORS[d%len(MAP_COLORS)],
-        label=f"D{d+1}: {pop_stats[d]/1000:.0f}k ({dev_pct[d]:+.1f}%)")
-       for d in range(N_DISTRICTS)]
-ax.legend(handles=leg_d+split_legend_handles(),loc="lower left",
-          fontsize=7,ncol=2,framealpha=0.92,edgecolor="none")
-ax.set_title(
-    f"{STATE_NAME} — {N_DISTRICTS} Districts ({APPORTIONMENT_YEAR} apportionment)\n"
-    f"Population-Bisecting Splitline {VERSION}  |  "
-    f"★ = Rep. office  |  ● = Population center (bisection anchor)",
-    fontsize=12,fontweight="500",pad=12)
-set_state_bounds(ax)
+    plt.suptitle(
+        "Inset Detail: Urban Density vs Rural Sparsity — same data, different scales",
+        fontsize=11, color="white", fontweight="500", y=1.02)
+    plt.tight_layout()
+    blocks_insets_tmp = os.path.join(OUTPUT_DIR, "blocks_insets_tmp.png")
+    fig_b2.savefig(blocks_insets_tmp, dpi=BLOCKS_DPI, bbox_inches="tight",
+                   facecolor=fig_b2.get_facecolor())
+    plt.close()
 
-ax2=axes[1]; ax2.set_facecolor("#D6EAF8")
-max_d2=max(dev_pct.abs().max(),MAX_TOTAL_DEV*100*3,0.5)
-cmap2=plt.cm.RdYlGn_r
-norm2=mcolors.TwoSlopeNorm(vmin=-max_d2,vcenter=0,vmax=max_d2)
-for d in range(N_DISTRICTS):
-    if d in district_shapes.index:
-        district_shapes.loc[[d]].plot(ax=ax2,
-            color=cmap2(norm2(float(dev_pct[d]))),linewidth=0,alpha=0.92)
-district_shapes.boundary.plot(ax=ax2,color="white",linewidth=1.8)
-for d in range(N_DISTRICTS):
-    if d in district_shapes.index:
-        c=district_shapes.loc[d].geometry.centroid
-        ok="✓" if abs(dev_pct[d])<=MAX_TOTAL_DEV*100 else "✗"
-        ax2.annotate(f"D{d+1}: {dev_pct[d]:+.3f}% {ok}",
-                     (c.x,c.y),ha="center",va="center",fontsize=8,fontweight="500",
-                     bbox=dict(boxstyle="round,pad=0.25",facecolor="white",
-                               alpha=0.88,edgecolor="none"),zorder=9)
-sm2=plt.cm.ScalarMappable(cmap=cmap2,norm=norm2); sm2.set_array([])
-fig.colorbar(sm2,ax=ax2,shrink=0.65,pad=0.02,label="Population deviation (%)")
-ax2.set_title(f"Population Deviation | Target: <{MAX_TOTAL_DEV*100:.1f}%\n"
-              f"Max: {max_dev:.4f}% | {result}",
-              fontsize=12,fontweight="500",pad=12)
-set_state_bounds(ax2)
-plt.suptitle(
-    f"{STATE_NAME} Fair Redistricting {VERSION}  |  "
-    f"Pop: {total_pop:,}  |  Target: {target_pop:,.0f}/district  |  "
-    f"Max deviation: {max_dev:.4f}%  |  {result}",
-    fontsize=11,fontweight="500",y=1.01)
-plt.tight_layout()
-plt.savefig(MAP_PNG,dpi=150,bbox_inches="tight",facecolor=fig.get_facecolor())
-plt.close()
-log.info(f"  Saved: {MAP_PNG}")
+    img_main   = PILImage.open(blocks_main_tmp)
+    img_insets = PILImage.open(blocks_insets_tmp)
+    w_combined = max(img_main.width, img_insets.width)
+    combined   = PILImage.new("RGB", (w_combined, img_main.height + img_insets.height), "#1A1A2E")
+    combined.paste(img_main, (0, 0))
+    combined.paste(img_insets, (0, img_main.height))
+    combined.save(BLOCKS_PNG)
+    os.remove(blocks_main_tmp)
+    os.remove(blocks_insets_tmp)
+    log.info(f"  Saved: {BLOCKS_PNG}")
 
 
 # ── Stage 9: Summary chart ────────────────────────────────────
@@ -892,7 +1198,7 @@ plt.suptitle(f"{STATE_NAME} Fair Redistricting {VERSION}  |  "
              f"Max deviation: {max_dev:.4f}% | {result}",
              fontsize=11,fontweight="500",y=1.01)
 plt.tight_layout()
-plt.savefig(SUMMARY_PNG,dpi=150,bbox_inches="tight",facecolor=fig3.get_facecolor())
+plt.savefig(SUMMARY_PNG, dpi=MAP_DPI, bbox_inches="tight", facecolor=fig3.get_facecolor())
 plt.close()
 log.info(f"  Saved: {SUMMARY_PNG}")
 
@@ -970,7 +1276,7 @@ for page in range(n_pages):
         f"● = Population center before bisection",
         fontsize=11,fontweight="500",y=1.01)
     plt.tight_layout()
-    plt.savefig(process_page_path(page+1),dpi=140,bbox_inches="tight",
+    plt.savefig(process_page_path(page+1), dpi=PROCESS_DPI, bbox_inches="tight",
                 facecolor=fig2.get_facecolor())
     plt.close()
     log.info(f"  Saved: {process_page_path(page+1)}")
