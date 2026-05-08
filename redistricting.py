@@ -160,8 +160,14 @@ STATE       = STATES[STATE_NAME]
 STATE_FIPS  = STATE["fips"]
 N_DISTRICTS = STATE["districts"]
 
-_cities_df  = pd.read_csv(os.path.join("data", "cities.csv")) if os.path.exists(os.path.join("data", "cities.csv")) else pd.DataFrame()
-_state_rows = _cities_df[_cities_df["state"] == STATE_NAME].head(N_DISTRICTS * 10) if not _cities_df.empty else pd.DataFrame()
+_cities_path = os.path.join("data", "cities.csv")
+_cities_df   = pd.read_csv(_cities_path) if os.path.exists(_cities_path) else pd.DataFrame()
+if _cities_df.empty or STATE_NAME not in _cities_df["state"].values:
+    print(f"  cities.csv missing or has no entries for {STATE_NAME} — running build_cities.py...")
+    import subprocess
+    subprocess.run([sys.executable, "build_cities.py"], check=True)
+    _cities_df = pd.read_csv(_cities_path)
+_state_rows  = _cities_df[_cities_df["state"] == STATE_NAME].head(N_DISTRICTS * 10)
 STATE_CITIES = list(zip(_state_rows["city"], _state_rows["lat"], _state_rows["lon"]))
 
 FIRST_CUT_ANGLE = 135.0
