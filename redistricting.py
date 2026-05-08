@@ -238,36 +238,45 @@ log.info("[Stage 1] Loading census block centroids")
 URL = (f"https://www2.census.gov/geo/tiger/TIGER2020/TABBLOCK20/"
        f"tl_2020_{STATE_FIPS}_tabblock20.zip")
 
+if not os.path.exists(SHP_DIR):
+    log.info(f"  Downloading {STATE_NAME} shapefile...")
+    urllib.request.urlretrieve(URL, ZIP_PATH)
+    with zipfile.ZipFile(ZIP_PATH,"r") as z: z.extractall(SHP_DIR)
+
+shp = [f for f in os.listdir(SHP_DIR) if f.endswith(".shp")][0]
+shp_path = os.path.join(SHP_DIR, shp)
+
+# Determine correct UTM zone from state's geographic center (shapefile is WGS84)
+log.info("  Loading shapefile...")
+gdf = gpd.read_file(shp_path)
+_minx, _miny, _maxx, _maxy = gdf.total_bounds
+_center_lon = (_minx + _maxx) / 2
+_utm_zone = int((_center_lon + 180) / 6) + 1
+UTM_EPSG = 26900 + _utm_zone
+log.info(f"  UTM zone: {_utm_zone} (EPSG:{UTM_EPSG})")
+
+gdf = gdf.to_crs(epsg=UTM_EPSG)
+gdf["POP20"] = gdf["POP20"].astype(int)
+gdf = gdf[(gdf["ALAND20"]>0)&(gdf["POP20"]>0)].copy().reset_index(drop=True)
+gdf["cx"] = gdf.geometry.centroid.x
+gdf["cy"] = gdf.geometry.centroid.y
+
+_use_cache = False
 if os.path.exists(CACHE_CSV):
-    log.info(f"  Cache: {CACHE_CSV}")
-    df      = pd.read_csv(CACHE_CSV)
-    cx_all  = df["cx"].values;   cy_all  = df["cy"].values
-    pop_all = df["POP20"].values; geoids  = df["GEOID20"].values
-    log.info(f"  {len(df):,} blocks. Loading geometries...")
-    shp = [f for f in os.listdir(SHP_DIR) if f.endswith(".shp")][0]
-    gdf = gpd.read_file(os.path.join(SHP_DIR, shp))
-    gdf = gdf.to_crs(epsg=26913)
-    gdf["POP20"] = gdf["POP20"].astype(int)
-    gdf = gdf[(gdf["ALAND20"]>0)&(gdf["POP20"]>0)].copy().reset_index(drop=True)
-    gdf["cx"] = gdf.geometry.centroid.x
-    gdf["cy"] = gdf.geometry.centroid.y
-else:
-    if not os.path.exists(SHP_DIR):
-        log.info(f"  Downloading {STATE_NAME} shapefile...")
-        urllib.request.urlretrieve(URL, ZIP_PATH)
-        with zipfile.ZipFile(ZIP_PATH,"r") as z: z.extractall(SHP_DIR)
-    shp = [f for f in os.listdir(SHP_DIR) if f.endswith(".shp")][0]
-    log.info("  Loading shapefile...")
-    gdf = gpd.read_file(os.path.join(SHP_DIR, shp))
-    gdf = gdf.to_crs(epsg=26913)
-    gdf["POP20"] = gdf["POP20"].astype(int)
-    gdf = gdf[(gdf["ALAND20"]>0)&(gdf["POP20"]>0)].copy().reset_index(drop=True)
-    gdf["cx"] = gdf.geometry.centroid.x
-    gdf["cy"] = gdf.geometry.centroid.y
-    gdf[["GEOID20","POP20","cx","cy"]].to_csv(CACHE_CSV, index=False)
-    log.info(f"  Cache saved: {CACHE_CSV}")
+    _cdf = pd.read_csv(CACHE_CSV)
+    if "utm_epsg" in _cdf.columns and int(_cdf["utm_epsg"].iloc[0]) == UTM_EPSG:
+        log.info(f"  Cache: {CACHE_CSV}")
+        cx_all  = _cdf["cx"].values;   cy_all  = _cdf["cy"].values
+        pop_all = _cdf["POP20"].values; geoids  = _cdf["GEOID20"].values
+        _use_cache = True
+    else:
+        log.info(f"  Cache EPSG mismatch — recomputing centroids...")
+
+if not _use_cache:
     cx_all  = gdf["cx"].values;   cy_all  = gdf["cy"].values
     pop_all = gdf["POP20"].values; geoids  = gdf["GEOID20"].values
+    gdf[["GEOID20","POP20","cx","cy"]].assign(utm_epsg=UTM_EPSG).to_csv(CACHE_CSV, index=False)
+    log.info(f"  Cache saved: {CACHE_CSV}")
 
 total_pop  = pop_all.sum()
 target_pop = total_pop / N_DISTRICTS
@@ -276,8 +285,8 @@ xmin_s,xmax_s = cx_all.min(),cx_all.max()
 ymin_s,ymax_s = cy_all.min(),cy_all.max()
 log.info(f"  {n_blocks:,} blocks | pop: {total_pop:,} | target: {target_pop:,.0f}")
 
-utm_to_wgs84 = Transformer.from_crs("EPSG:26913","EPSG:4326",always_xy=True)
-wgs84_to_utm = Transformer.from_crs("EPSG:4326","EPSG:26913",always_xy=True)
+utm_to_wgs84 = Transformer.from_crs(f"EPSG:{UTM_EPSG}","EPSG:4326",always_xy=True)
+wgs84_to_utm = Transformer.from_crs("EPSG:4326",f"EPSG:{UTM_EPSG}",always_xy=True)
 
 def utm_to_latlon(utm_x, utm_y):
     lon, lat = utm_to_wgs84.transform(utm_x, utm_y)
