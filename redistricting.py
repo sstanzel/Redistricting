@@ -173,6 +173,20 @@ STATES = {
 
 APPORTIONMENT_YEAR = 2020
 
+# ── Global constants needed before per-state setup ────────────
+STATES_DIR = os.path.join("data", "states")  # shared across all states
+
+MAP_COLORS = [
+    "#4E79A7", "#F28E2B", "#59A14F", "#E15759",
+    "#76B7B2", "#EDC948", "#B07AA1", "#FF9DA7",
+    "#9C755F", "#BAB0AC", "#D37295", "#A0CBE8",
+    "#86BCB6", "#F1CE63", "#B6992D", "#499894",
+]
+
+TIGER_STATE_URL = "https://www2.census.gov/geo/tiger/TIGER2020/STATE/tl_2020_us_state.zip"
+TIGER_STATE_ZIP = os.path.join(STATES_DIR, "tl_2020_us_state.zip")
+TIGER_STATE_SHP = os.path.join(STATES_DIR, "tl_2020_us_state.shp")
+
 # ── Argument parsing — runs before per-state pipeline setup ───
 _parser = argparse.ArgumentParser(
     prog="redistricting.py",
@@ -196,6 +210,82 @@ if _args.state:
     STATE_NAME = _args.state
 
 
+def _generate_single_district_map(state_name: str) -> str | None:
+    """Generate a district map PNG for a single-district state (no redistricting needed).
+
+    Draws the state outline filled with D1 color on a dark background, labelled with the
+    largest city and a note that the entire state is one congressional district.
+    Returns the path to the saved PNG, or None on error.
+    """
+    _fips = STATES[state_name]["fips"]
+    _slug = state_name.replace(" ", "_")
+    _out_dir = os.path.join("output", f"redistricting_{_slug}_{VERSION}", "assets")
+    os.makedirs(_out_dir, exist_ok=True)
+    _png = os.path.join(_out_dir, f"districts_{_slug}_{VERSION}.png")
+
+    if os.path.exists(_png):
+        print(f"  Using cached: {_png}")
+        return _png
+
+    # Ensure national state shapefile is present
+    os.makedirs(STATES_DIR, exist_ok=True)
+    if not os.path.exists(TIGER_STATE_SHP):
+        print(f"  Downloading national state shapefile...")
+        urllib.request.urlretrieve(TIGER_STATE_URL, TIGER_STATE_ZIP)
+        with zipfile.ZipFile(TIGER_STATE_ZIP) as _z:
+            _z.extractall(STATES_DIR)
+
+    _states_gdf = gpd.read_file(TIGER_STATE_SHP)
+    _state_geom = _states_gdf[_states_gdf["STATEFP"] == _fips].copy()
+    if _state_geom.empty:
+        print(f"  ERROR: FIPS {_fips} not found in state shapefile")
+        return None
+
+    _epsg = 3338 if _fips == "02" else (26904 if _fips == "15" else 5070)
+    _state_geom = _state_geom.to_crs(epsg=_epsg)
+
+    # Largest city for the label
+    _cities_path = os.path.join("data", "cities.csv")
+    _city_label = state_name
+    if os.path.exists(_cities_path):
+        _cdf = pd.read_csv(_cities_path)
+        _top = _cdf[_cdf["state"] == state_name].nlargest(1, "population")
+        if not _top.empty:
+            _city_label = _top.iloc[0]["city"]
+
+    _pop = STATES[state_name].get("pop", "")  # not stored, just leave blank
+
+    fig, ax = plt.subplots(figsize=(14, 10))
+    fig.patch.set_facecolor("#0D1117")
+    ax.set_facecolor("#0D1117")
+    _state_geom.plot(ax=ax, color=MAP_COLORS[0], alpha=0.85, linewidth=0)
+    _state_geom.boundary.plot(ax=ax, color="white", linewidth=1.5, alpha=0.9)
+
+    _bounds = _state_geom.total_bounds  # [minx, miny, maxx, maxy]
+    _cx = (_bounds[0] + _bounds[2]) / 2
+    _cy = (_bounds[1] + _bounds[3]) / 2
+    ax.annotate(
+        f"D1 · {_city_label}",
+        (_cx, _cy), ha="center", va="center",
+        fontsize=16, color="white", fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.5", facecolor="#0D1117", alpha=0.75,
+                  edgecolor="white", linewidth=1.2),
+    )
+
+    ax.set_title(
+        f"{state_name} — 1 Congressional District\n"
+        "Entire state forms a single at-large district (2020 Census apportionment)",
+        fontsize=14, fontweight="500", color="white", pad=12,
+    )
+    ax.set_aspect("equal")
+    ax.axis("off")
+    plt.tight_layout()
+    fig.savefig(_png, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"  Saved: {_png}")
+    return _png
+
+
 def _run_usa_mode(districts_mode: bool, full_mode: bool) -> None:
     """Step through all 50 states alphabetically via subprocess, then bundle if districts_mode."""
     import subprocess as _sp
@@ -210,13 +300,17 @@ def _run_usa_mode(districts_mode: bool, full_mode: bool) -> None:
 
     for _state in _states_sorted:
         _n = STATES[_state]["districts"]
-        if _n == 1:
-            # Single-district states have no redistricting; skip entirely
-            print(f"  Skipping {_state} (1 district — no redistricting)\n")
-            continue
         print(f"\n{'─'*60}")
-        print(f"  {_state} ({_n} districts)")
+        print(f"  {_state} ({_n} district{'s' if _n != 1 else ''})")
         print(f"{'─'*60}")
+        if _n == 1:
+            # Generate a simple at-large state map; no redistricting needed
+            _png = _generate_single_district_map(_state)
+            if _png:
+                _passed.append(_state)
+            else:
+                _failed.append(_state)
+            continue
         _cmd = [sys.executable, __file__, "--state", _state]
         if full_mode:
             _cmd.append("--full")
@@ -268,8 +362,6 @@ def _bundle_usa_districts_pdf(states_sorted: list[str]) -> None:
     _story.append(Spacer(1, 0.15 * _inch))
 
     for _state in states_sorted:
-        if STATES[_state]["districts"] == 1:
-            continue  # single-district states excluded
         _slug = _state.replace(" ", "_")
         _png = os.path.join(
             "output", f"redistricting_{_slug}_{VERSION}",
@@ -342,7 +434,6 @@ else:
 
 STATE_SLUG = STATE_NAME.replace(" ", "_")
 DATA_DIR   = os.path.join("data", STATE_FIPS)
-STATES_DIR = os.path.join("data", "states")   # shared across all states
 ZIP_PATH   = os.path.join(DATA_DIR, f"tl_2020_{STATE_FIPS}_tabblock20.zip")
 SHP_DIR    = os.path.join(DATA_DIR, "blocks")
 CACHE_CSV  = os.path.join(DATA_DIR, "centroids_cache.csv")
@@ -379,12 +470,6 @@ CODE_PDF       = os.path.join(OUTPUT_DIR, f"source_code_{VERSION}.pdf")
 def process_page_path(n: int) -> str:
     return os.path.join(ASSETS_DIR, f"process_page{n}_{STATE_SLUG}_{VERSION}.png")
 
-MAP_COLORS = [
-    "#4E79A7","#F28E2B","#59A14F","#E15759",
-    "#76B7B2","#EDC948","#B07AA1","#FF9DA7",
-    "#9C755F","#BAB0AC","#D37295","#A0CBE8",
-    "#86BCB6","#F1CE63","#B6992D","#499894",
-]
 SPLIT_COLORS = {0:"#C0392B",1:"#E67E22",2:"#27AE60",3:"#8E44AD",4:"#2980B9"}
 SPLIT_WIDTH  = {0:2.8,1:2.2,2:1.8,3:1.4,4:1.2}
 
@@ -407,11 +492,6 @@ MAP_RASTER_H    = 900    # grid height (pixels)
 MAP_RASTER_GAMMA     = 0.8   # brightness gamma: <1 = convex, rural cells stay visible
 MAP_BRIGHT_FLOOR     = 0.35  # minimum brightness for any populated raster cell
 MAP_VORONOI_DIM      = 0.20  # brightness for unpopulated Voronoi fill cells
-
-# Census TIGER national state boundary — downloaded once to data/states/, reused
-TIGER_STATE_URL = "https://www2.census.gov/geo/tiger/TIGER2020/STATE/tl_2020_us_state.zip"
-TIGER_STATE_ZIP = os.path.join(STATES_DIR, "tl_2020_us_state.zip")
-TIGER_STATE_SHP = os.path.join(STATES_DIR, "tl_2020_us_state.shp")
 
 # ── Logging ───────────────────────────────────────────────────
 log_path = os.path.join(LOGS_DIR,
