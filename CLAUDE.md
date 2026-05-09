@@ -6,108 +6,102 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Generates politically-neutral U.S. congressional district maps using a **population-bisecting splitline algorithm** applied to 2020 Census block data. Given a state name, the script downloads shapefiles, recursively splits the state population in half along straight lines until N districts are formed, then fine-tunes via border-swapping to achieve <1% population deviation across districts. No political data is used — the same Census data always produces the identical map.
 
-A companion script (`election_analysis.py`) overlays historical election results onto the proposed districts to show predicted partisan outcomes.
-
 ## How to Run
 
 ```bash
 # Install dependencies (one time)
 pip install geopandas matplotlib shapely scipy numpy pandas tqdm reportlab pypdf pyproj pillow openpyxl
 
-# Run redistricting for the configured state
+# Quick mode — district map PNG only (fast, uses cached checkpoints)
 python redistricting.py
 
-# Run election analysis (requires 3 data files — see below)
-python election_analysis.py
+# Full report — all maps, process pages, CSVs, and PDF
+python redistricting.py --full
+
+# All 50 states, one bundled district-map PDF (planned — not yet implemented)
+python redistricting.py --usa_districts
+
+# All 50 states, full reports (planned — not yet implemented)
+python redistricting.py --usa_full
 ```
 
-The redistricting script auto-detects checkpoint `.npy` files — if a prior run completed, heavy computation is skipped and only maps/PDFs are regenerated.
+The script auto-detects checkpoint files — if a prior run completed, heavy computation is skipped and only maps/PDFs are regenerated.
 
-To run a different state, change `STATE_NAME`, then run the same command. Each state's data downloads once into `data/{FIPS}/` and is reused on subsequent runs.
+To run a different state, change `STATE_NAME` at the top of the script, then run the same command. Each state's data downloads once into `data/{FIPS}/` and is reused on subsequent runs.
 
 ## Configuration
 
-All user-facing settings are at the top of the script (lines 93–96):
-
 ```python
-STATE_NAME = "Colorado"   # Any key from the STATES dict (lines 99–150)
+STATE_NAME = "Colorado"   # Any key from the STATES dict
 AUTHOR     = "Steve Stanzel, Boulder CO"
 ```
 
 Changing `STATE_NAME` automatically sets `N_DISTRICTS`, `STATE_FIPS`, and all output paths. The `STATES` dict covers all 50 states with 2020 apportionment seat counts (valid through 2032).
 
-**CRS note:** All geometry uses EPSG:26913 (Colorado UTM Zone 13N, meters). This is accurate for Colorado but must be updated when running other states — use the appropriate UTM zone for the target state.
+**CRS:** All geometry uses EPSG:5070 (NAD83 Conus Albers Equal-Area, metres). Applies to all contiguous states.
 
-**City lists:** `COLORADO_CITIES` (lines 154–247) is the only hardcoded state city list. Other states need their own list added or a geocoding API fallback.
+**City data:** `data/cities.csv` — 2020 Census place populations for all 50 states, built by `build_cities.py`. Auto-rebuilt if missing or stale.
 
 ## Directory Structure
 
 ```
-data/{FIPS}/                    # gitignored — downloaded once per state, reused
+data/{FIPS}/                         # gitignored — downloaded once per state
   tl_2020_{FIPS}_tabblock20.zip
-  blocks/                       # extracted Census shapefile
-  centroids_cache.csv           # cached block centroids (generated on first run)
+  blocks/                            # extracted Census shapefile
+  centroids_cache.csv                # cached block centroids
 
-output/redistricting_{STATE}_{VERSION}/   # gitignored — all generated results
-  districts_*.png               # final district map
-  summary_*.png                 # population balance chart
-  census_blocks_*.png           # raw census block visualization
-  process_page*.png             # step-by-step algorithm explainer
-  block_assignments_*.csv       # GEOID20 → district number
-  district_summary_*.csv        # per-district population, deviation, city, compactness
-  split_log_*.csv               # each splitline's angle and balance error
-  report_*.pdf                  # comprehensive PDF with algorithm explanation and maps
-  source_code_*.pdf             # full source for reproducibility
-  checkpoint_*.npy              # saved computation state (delete to force recomputation)
-  election_analysis/            # created by election_analysis.py (see below)
+data/cities.csv                      # git-tracked — all 50 states, ~31k places
+data/states/                         # shared state boundary shapefiles + raster masks
+
+output/redistricting_{STATE}_{VERSION}/   # gitignored
+  assets/                            # all PNGs
+    districts_*.png                  # city-lights district map
+    districts_filled_*.png           # solid-color district map (standalone)
+    census_complexity_*.png          # census block outline density map
+    census_blocks_*.png              # population density map with insets
+    summary_*.png                    # population balance chart
+    swap_comparison_*.png            # before/after swap map
+    swap_zoom_*.png                  # zoomed swap detail
+    process_page*.png                # step-by-step splitline diagrams
+  data/                              # .npy and .pkl checkpoint files
+    checkpoint_*.npy
+    checkpoint_swap_*.npy
+    checkpoint_dissolve_*.pkl
+  logs/                              # run .log files
+  block_assignments_*.csv            # GEOID20 → district number
+  district_summary_*.csv             # per-district population, deviation, city, area
+  split_log_*.csv                    # each splitline's angle and balance error
+  report_*.pdf                       # comprehensive PDF report
+  source_code_*.pdf                  # full source for reproducibility
 ```
-
-**Colorado result:** 8 districts, max deviation 0.61% (PASS ✓), average Polsby-Popper compactness ~0.686.
-
-## Election Analysis Script
-
-`election_analysis.py` is built but blocked on manual data download — the Colorado SOS site blocks bots. Three files must be downloaded by hand:
-
-| File | Source | Save as |
-|------|--------|---------|
-| 2024 precinct results | coloradosos.org → "2024 General Election precinct level results (XLSX)" | `2024_precinct_results.xlsx` |
-| Voter registration | sos.state.co.us → October 2024 voter registration stats | `2024_voter_registration.xlsx` |
-| Precinct boundaries | sos.state.co.us → 2024 precinct shapefile | Unzip to `precinct_boundaries/` |
-
-Once files are present, the script: spatial-joins precincts to proposed districts → aggregates 2024 presidential votes (Trump/Harris) → aggregates voter registration (R/D/Unaffiliated) → predicts winner per district → rates competitiveness (Safe >15pt, Likely >8pt, Lean >3pt, Toss-up ≤3pt) → outputs maps, charts, and a PDF report.
-
-**Known:** The script auto-detects column names from the XLSX files and logs them. The `COLUMN CONFIG` section may need manual updates after first run. Spatial join is slow — checkpointing is a planned improvement (not yet implemented).
 
 ## Architecture
 
-The codebase is a **single monolithic script** (`redistricting.py`, ~1,440 lines) organized into sequential numbered stages, each delimited by `# ── Stage N` comments. Older versions are in `archive/`; the current version is tracked via the `VERSION` constant and git tags.
+Single monolithic script (`redistricting.py`, ~2500 lines) organized into sequential numbered stages delimited by `# ── Stage N` comments. Current version tracked via `VERSION` constant and git tags.
 
 **Data flow:**
-1. **Load/cache** — Download TIGER shapefile for state FIPS into `data/{FIPS}/`, extract to `blocks/`, cache centroids to `centroids_cache.csv`; all reused on subsequent runs
-2. **Splitline** — Recursive population bisection: find centroid → sweep angles → split on line that best halves population → recurse on each half; alternates between `FIRST_CUT_ANGLE=135°` and `ALT_CUT_ANGLE=45°` as seed angles per depth level
-3. **Border swap** — `N_SWAP_ROUNDS=200` passes of reassigning boundary blocks to neighboring districts to tighten population balance
-4. **Dissolve** — `geopandas` `dissolve()` merges blocks into district polygons
-5. **City lookup** — Finds nearest named city to each district centroid using pyproj UTM→WGS84 + haversine distance
-6. **Visualizations** — `matplotlib` renders maps, process diagrams, and summary charts
-7. **PDF export** — `reportlab` assembles the report; `pypdf` merges source code PDF
+1. **Load/cache** — Download TIGER shapefile, extract, cache centroids
+2. **Splitline** — Recursive population bisection alternating 135°/45° seed angles
+3. **Border swap** — Up to `N_SWAP_ROUNDS` passes reassigning boundary blocks to tighten balance
+4. **Dissolve** — `geopandas dissolve()` merges blocks into district polygons
+5. **City lookup** — `representative_city()`: scores cities inside district by `log(pop) × exp(-dist/radius)`
+6. **Visualizations** — city-lights raster map, census block maps, process pages, summary chart
+7. **PDF export** — `reportlab` report + `pypdf` source code appendix
 
-**Key constants** (lines 258–268):
-- `MAX_TOTAL_DEV = 0.01` — Target ≤1% population deviation across all districts
-- `MAX_SPLIT_ERROR = MAX_TOTAL_DEV / MAX_DEPTH` — Per-level tolerance (depth = ⌈log₂(N)⌉)
-- `SEARCH_RADIUS = 45.0` — Degrees swept around seed angle when finding balance split
-- `MAP_COLORS` — 16-color palette for district rendering
+**Key constants:**
+- `MAX_TOTAL_DEV = 0.01` — ≤1% population deviation target
+- `SEARCH_RADIUS = 45.0` — degrees swept around seed angle
+- `MAP_COLORS` — 16-color palette
 
 **Census data URL pattern:**
 `https://www2.census.gov/geo/tiger/TIGER2020/TABBLOCK20/tl_2020_{FIPS}_tabblock20.zip`
 
-## Known Issues / Planned (v13)
+## Known Issues / Backlog
 
-- **Election analysis checkpointing** — spatial join is slow, should cache to `.npy` like redistricting does
-- **Process page label overlap** — population labels (e.g. "2893k") sometimes overlap the split line anchor dot; needs offset logic
-- **Census block explainer** — consider adding a scale bar to the dark background map
-- **State city lists** — only Colorado is hardcoded; other states need city lists or a geocoding API fallback
-- **UTM zone generalization** — EPSG:26913 is hardcoded throughout; needs to be derived from state when running other states
+- **Label placement** — Dense metro clusters (e.g. Virginia NoVA) cause callout label overlaps and line crossings. Needs cluster-aware placement rewrite.
+- **Legend position** — Population density map legend (Stage 7b) can overlap the state outline on tall states. Needs manual legend placement outside state bounds.
+- **--usa_districts / --usa_full** — Planned multi-state batch flags not yet implemented.
 
 ## Versioning Convention
 
-Each version is a standalone `.py` file. Changes between versions are documented in the module docstring at the top of each file. When creating a new version, copy the current file, bump the `VERSION` constant and filename, and document changes in the docstring.
+Bump `VERSION` constant and git tag for each release. Backward-compat checkpoint search automatically checks the prior version's `data/` folder so existing computation is reused.
