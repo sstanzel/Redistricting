@@ -2070,9 +2070,20 @@ story.append(Paragraph(
     f"polygon bounded by streets, waterways, or other visible features, containing "
     f"a precise count of residents on Census day (April 1, 2020). District "
     f"boundaries in this proposal always follow block boundaries — they never cut "
-    f"through a block. The map below shows every populated block in the state, "
-    f"colored by population. Three inset panels compare urban density against "
-    f"rural sparsity at finer detail.",ps["body"]))
+    f"through a block.",ps["body"]))
+story.append(Paragraph(
+    "The first map below draws every block boundary as a faint white line on a dark "
+    "background. Where blocks are small and tightly packed — dense urban cores — "
+    "thousands of overlapping edges light up the map. Where blocks are large and "
+    "sparse — rural plains and mountains — the few edges barely register. This map "
+    "shows data structure only: no population, no districts.",ps["body"]))
+_complexity_embed = _img_embed(COMPLEXITY_PNG, 6.8)
+story.append(RLImage(COMPLEXITY_PNG, width=_complexity_embed[0], height=_complexity_embed[1]))
+story.append(Spacer(1,10))
+story.append(Paragraph(
+    "The second map colors each block by its population. "
+    "Three inset panels compare urban density against rural sparsity at finer detail.",
+    ps["body"]))
 story.append(RLImage(BLOCKS_PNG,width=6.8*inch,height=5.5*inch))
 story.append(Spacer(1,8))
 
