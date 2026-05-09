@@ -214,8 +214,8 @@ def _generate_single_district_map(state_name: str) -> str | None:
     """Generate a district map PNG for a single-district state (no redistricting needed).
 
     Draws the state outline filled with D1 color on a dark background, labelled with the
-    largest city and a note that the entire state is one congressional district.
-    Returns the path to the saved PNG, or None on error.
+    representative city chosen by the same log-pop × distance-decay scoring used for
+    multi-district states.  Returns the path to the saved PNG, or None on error.
     """
     _fips = STATES[state_name]["fips"]
     _slug = state_name.replace(" ", "_")
@@ -243,17 +243,42 @@ def _generate_single_district_map(state_name: str) -> str | None:
 
     _epsg = 3338 if _fips == "02" else (26904 if _fips == "15" else 5070)
     _state_geom = _state_geom.to_crs(epsg=_epsg)
+    _geom = _state_geom.geometry.union_all()
 
-    # Largest city for the label
+    # Build per-state coordinate transformers (same logic as main pipeline)
+    _to_proj  = Transformer.from_crs("EPSG:4326",   f"EPSG:{_epsg}", always_xy=True)
+    _from_proj = Transformer.from_crs(f"EPSG:{_epsg}", "EPSG:4326",  always_xy=True)
+
+    def _ll_to_proj(lat: float, lon: float) -> tuple[float, float]:
+        return _to_proj.transform(lon, lat)
+
+    # Geographic centroid as district centroid (no census blocks available here)
+    _centroid = _geom.centroid
+    _cx, _cy = _centroid.x, _centroid.y
+    _district_radius_m = math.sqrt(_geom.area / math.pi)
+
+    # Same scoring as representative_city(): log(pop) × exp(−dist / radius)
     _cities_path = os.path.join("data", "cities.csv")
     _city_label = state_name
     if os.path.exists(_cities_path):
         _cdf = pd.read_csv(_cities_path)
-        _top = _cdf[_cdf["state"] == state_name].nlargest(1, "population")
-        if not _top.empty:
-            _city_label = _top.iloc[0]["city"]
-
-    _pop = STATES[state_name].get("pop", "")  # not stored, just leave blank
+        _scities = _cdf[_cdf["state"] == state_name]
+        _best_score = -1.0
+        _fallback: tuple[str, float] = ("", float("inf"))
+        for _, _row in _scities.iterrows():
+            _ux, _uy = _ll_to_proj(float(_row["lat"]), float(_row["lon"]))
+            _dist_m = math.hypot(_ux - _cx, _uy - _cy)
+            if _geom.contains(Point(_ux, _uy)):
+                _score = math.log(max(int(_row["population"]), 1)) * math.exp(
+                    -_dist_m / _district_radius_m
+                )
+                if _score > _best_score:
+                    _best_score = _score
+                    _city_label = _row["city"]
+            elif _dist_m < _fallback[1]:
+                _fallback = (_row["city"], _dist_m)
+        if _best_score < 0 and _fallback[0]:
+            _city_label = _fallback[0]
 
     fig, ax = plt.subplots(figsize=(14, 10))
     fig.patch.set_facecolor("#0D1117")
