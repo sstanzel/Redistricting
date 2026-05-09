@@ -210,107 +210,6 @@ if _args.state:
     STATE_NAME = _args.state
 
 
-def _generate_single_district_map(state_name: str) -> str | None:
-    """Generate a district map PNG for a single-district state (no redistricting needed).
-
-    Draws the state outline filled with D1 color on a dark background, labelled with the
-    representative city chosen by the same log-pop × distance-decay scoring used for
-    multi-district states.  Returns the path to the saved PNG, or None on error.
-    """
-    _fips = STATES[state_name]["fips"]
-    _slug = state_name.replace(" ", "_")
-    _out_dir = os.path.join("output", f"redistricting_{_slug}_{VERSION}", "assets")
-    os.makedirs(_out_dir, exist_ok=True)
-    _png = os.path.join(_out_dir, f"districts_{_slug}_{VERSION}.png")
-
-    if os.path.exists(_png):
-        print(f"  Using cached: {_png}")
-        return _png
-
-    # Ensure national state shapefile is present
-    os.makedirs(STATES_DIR, exist_ok=True)
-    if not os.path.exists(TIGER_STATE_SHP):
-        print(f"  Downloading national state shapefile...")
-        urllib.request.urlretrieve(TIGER_STATE_URL, TIGER_STATE_ZIP)
-        with zipfile.ZipFile(TIGER_STATE_ZIP) as _z:
-            _z.extractall(STATES_DIR)
-
-    _states_gdf = gpd.read_file(TIGER_STATE_SHP)
-    _state_geom = _states_gdf[_states_gdf["STATEFP"] == _fips].copy()
-    if _state_geom.empty:
-        print(f"  ERROR: FIPS {_fips} not found in state shapefile")
-        return None
-
-    _epsg = 3338 if _fips == "02" else (26904 if _fips == "15" else 5070)
-    _state_geom = _state_geom.to_crs(epsg=_epsg)
-    _geom = _state_geom.geometry.union_all()
-
-    # Build per-state coordinate transformers (same logic as main pipeline)
-    _to_proj  = Transformer.from_crs("EPSG:4326",   f"EPSG:{_epsg}", always_xy=True)
-    _from_proj = Transformer.from_crs(f"EPSG:{_epsg}", "EPSG:4326",  always_xy=True)
-
-    def _ll_to_proj(lat: float, lon: float) -> tuple[float, float]:
-        return _to_proj.transform(lon, lat)
-
-    # Geographic centroid as district centroid (no census blocks available here)
-    _centroid = _geom.centroid
-    _cx, _cy = _centroid.x, _centroid.y
-    _district_radius_m = math.sqrt(_geom.area / math.pi)
-
-    # Same scoring as representative_city(): log(pop) × exp(−dist / radius)
-    _cities_path = os.path.join("data", "cities.csv")
-    _city_label = state_name
-    if os.path.exists(_cities_path):
-        _cdf = pd.read_csv(_cities_path)
-        _scities = _cdf[_cdf["state"] == state_name]
-        _best_score = -1.0
-        _fallback: tuple[str, float] = ("", float("inf"))
-        for _, _row in _scities.iterrows():
-            _ux, _uy = _ll_to_proj(float(_row["lat"]), float(_row["lon"]))
-            _dist_m = math.hypot(_ux - _cx, _uy - _cy)
-            if _geom.contains(Point(_ux, _uy)):
-                _score = math.log(max(int(_row["population"]), 1)) * math.exp(
-                    -_dist_m / _district_radius_m
-                )
-                if _score > _best_score:
-                    _best_score = _score
-                    _city_label = _row["city"]
-            elif _dist_m < _fallback[1]:
-                _fallback = (_row["city"], _dist_m)
-        if _best_score < 0 and _fallback[0]:
-            _city_label = _fallback[0]
-
-    fig, ax = plt.subplots(figsize=(14, 10))
-    fig.patch.set_facecolor("#0D1117")
-    ax.set_facecolor("#0D1117")
-    _state_geom.plot(ax=ax, color=MAP_COLORS[0], alpha=0.85, linewidth=0)
-    _state_geom.boundary.plot(ax=ax, color="white", linewidth=1.5, alpha=0.9)
-
-    _bounds = _state_geom.total_bounds  # [minx, miny, maxx, maxy]
-    _cx = (_bounds[0] + _bounds[2]) / 2
-    _cy = (_bounds[1] + _bounds[3]) / 2
-    ax.annotate(
-        f"D1 · {_city_label}",
-        (_cx, _cy), ha="center", va="center",
-        fontsize=16, color="white", fontweight="bold",
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="#0D1117", alpha=0.75,
-                  edgecolor="white", linewidth=1.2),
-    )
-
-    ax.set_title(
-        f"{state_name} — 1 Congressional District\n"
-        "Entire state forms a single at-large district (2020 Census apportionment)",
-        fontsize=14, fontweight="500", color="white", pad=12,
-    )
-    ax.set_aspect("equal")
-    ax.axis("off")
-    plt.tight_layout()
-    fig.savefig(_png, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close()
-    print(f"  Saved: {_png}")
-    return _png
-
-
 def _run_usa_mode(districts_mode: bool, full_mode: bool) -> None:
     """Step through all 50 states alphabetically via subprocess, then bundle if districts_mode."""
     import subprocess as _sp
@@ -328,14 +227,6 @@ def _run_usa_mode(districts_mode: bool, full_mode: bool) -> None:
         print(f"\n{'─'*60}")
         print(f"  {_state} ({_n} district{'s' if _n != 1 else ''})")
         print(f"{'─'*60}")
-        if _n == 1:
-            # Generate a simple at-large state map; no redistricting needed
-            _png = _generate_single_district_map(_state)
-            if _png:
-                _passed.append(_state)
-            else:
-                _failed.append(_state)
-            continue
         _cmd = [sys.executable, __file__, "--state", _state]
         if full_mode:
             _cmd.append("--full")
@@ -533,10 +424,6 @@ log.info(f"  Districts: {N_DISTRICTS} | Depth: {MAX_DEPTH} | "
          f"Per-split tol: {MAX_SPLIT_ERROR*100:.3f}%")
 log.info("=" * 60)
 
-if N_DISTRICTS == 1:
-    log.info(f"{STATE_NAME} has 1 district — no splitting needed.")
-    sys.exit(0)
-
 if not FULL_REPORT:
     log.info("  Mode: quick  (district map PNG only; use --full for reports)")
 
@@ -624,6 +511,115 @@ def latlon_to_utm(lat: float, lon: float) -> tuple[float, float]:
     """
     x, y = wgs84_to_utm.transform(lon, lat)
     return x, y
+
+
+def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Compute the great-circle distance between two points in kilometers.
+
+    Args:
+        lat1: Latitude of the first point in decimal degrees.
+        lon1: Longitude of the first point in decimal degrees.
+        lat2: Latitude of the second point in decimal degrees.
+        lon2: Longitude of the second point in decimal degrees.
+
+    Returns:
+        Distance in kilometers.
+    """
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(a))
+
+
+def representative_city(
+    district_geom,
+    centroid_utm_x: float,
+    centroid_utm_y: float,
+) -> tuple[str, float, float, float, float, float, bool]:
+    """Select the best representative office city for a district.
+
+    Uses Option A: centroid-proximity score (log-population × distance decay).
+    All cities inside the district boundary are evaluated; the highest-scoring
+    one is returned.  Falls back to the nearest outside city only when no
+    qualified city exists inside the boundary.
+
+    Score formula:
+        score = log(city_population) × exp(−distance / district_radius)
+
+    where distance is the Euclidean UTM distance from the city to the
+    population-weighted centroid, and district_radius = sqrt(area / π) —
+    the radius of a circle with the same area as the district.
+
+    This balances two competing goals: pick a city large enough to host a
+    congressional office, but keep it near where the district's people live.
+    A city twice the district radius away must be roughly e² ≈ 7× more
+    populous than the centroid city to outscore it.  A city at the centroid
+    exactly scores the full log(population) with no penalty.
+
+    Args:
+        district_geom: Shapely geometry of the district in EPSG:5070.
+        centroid_utm_x: Population-weighted centroid easting (metres).
+        centroid_utm_y: Population-weighted centroid northing (metres).
+
+    Returns:
+        (city_name, dist_km, centroid_lat, centroid_lon,
+         city_lat, city_lon, city_in_district)
+    """
+    centroid_lat, centroid_lon = utm_to_latlon(centroid_utm_x, centroid_utm_y)
+    district_radius_m = math.sqrt(district_geom.area / math.pi)
+
+    best_score = -1.0
+    best_inside: tuple | None = None
+
+    fallback_dist_m = float("inf")
+    fallback: tuple | None = None
+
+    for city, clat, clon, cpop in STATE_CITIES:
+        city_utm_x, city_utm_y = latlon_to_utm(clat, clon)
+        dist_m = math.hypot(city_utm_x - centroid_utm_x, city_utm_y - centroid_utm_y)
+
+        if district_geom.contains(Point(city_utm_x, city_utm_y)):
+            score = math.log(max(cpop, 1)) * math.exp(-dist_m / district_radius_m)
+            if score > best_score:
+                best_score = score
+                best_inside = (city, round(dist_m / 1000, 1),
+                               centroid_lat, centroid_lon, clat, clon, True)
+        else:
+            if dist_m < fallback_dist_m:
+                fallback_dist_m = dist_m
+                fallback = (city, round(dist_m / 1000, 1),
+                            centroid_lat, centroid_lon, clat, clon, False)
+
+    if best_inside is not None:
+        return best_inside
+    return fallback or ("Unknown", 0.0, centroid_lat, centroid_lon,
+                        centroid_lat, centroid_lon, False)
+
+
+def load_tiger_state_boundary(fips: str, target_crs) -> gpd.GeoSeries:
+    """Return the official Census TIGER state boundary reprojected to target_crs.
+
+    Downloads tl_2020_us_state.zip once into data/states/ and caches the
+    extracted shapefile.  Subsequent calls skip the download.
+
+    Args:
+        fips: Two-digit state FIPS code (e.g. "08" for Colorado).
+        target_crs: CRS to reproject into — must match the census block data.
+
+    Returns:
+        GeoSeries with one Polygon or MultiPolygon for the state boundary.
+    """
+    os.makedirs(STATES_DIR, exist_ok=True)
+    if not os.path.exists(TIGER_STATE_SHP):
+        log.info("  Downloading Census TIGER state boundaries...")
+        urllib.request.urlretrieve(TIGER_STATE_URL, TIGER_STATE_ZIP)
+        with zipfile.ZipFile(TIGER_STATE_ZIP) as z:
+            z.extractall(STATES_DIR)
+        log.info(f"  Extracted to {STATES_DIR}/")
+    states = gpd.read_file(TIGER_STATE_SHP)
+    state  = states[states["STATEFP"] == fips]
+    return gpd.GeoSeries(state.geometry.values, crs=states.crs).to_crs(target_crs)
 
 
 # ── Stage 2: Split functions ──────────────────────────────────
@@ -990,89 +986,6 @@ log.info(f"  Avg compactness: {pp.mean():.3f}")
 # ── Stage 6: City lookup ──────────────────────────────────────
 log.info("[Stage 6] Nearest city lookup")
 
-def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Compute the great-circle distance between two points in kilometers.
-
-    Args:
-        lat1: Latitude of the first point in decimal degrees.
-        lon1: Longitude of the first point in decimal degrees.
-        lat2: Latitude of the second point in decimal degrees.
-        lon2: Longitude of the second point in decimal degrees.
-
-    Returns:
-        Distance in kilometers.
-    """
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlam = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
-    return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(a))
-
-
-def representative_city(
-    district_geom,
-    centroid_utm_x: float,
-    centroid_utm_y: float,
-) -> tuple[str, float, float, float, float, float, bool]:
-    """Select the best representative office city for a district.
-
-    Uses Option A: centroid-proximity score (log-population × distance decay).
-    All cities inside the district boundary are evaluated; the highest-scoring
-    one is returned.  Falls back to the nearest outside city only when no
-    qualified city exists inside the boundary.
-
-    Score formula:
-        score = log(city_population) × exp(−distance / district_radius)
-
-    where distance is the Euclidean UTM distance from the city to the
-    population-weighted centroid, and district_radius = sqrt(area / π) —
-    the radius of a circle with the same area as the district.
-
-    This balances two competing goals: pick a city large enough to host a
-    congressional office, but keep it near where the district's people live.
-    A city twice the district radius away must be roughly e² ≈ 7× more
-    populous than the centroid city to outscore it.  A city at the centroid
-    exactly scores the full log(population) with no penalty.
-
-    Args:
-        district_geom: Shapely geometry of the district in EPSG:5070.
-        centroid_utm_x: Population-weighted centroid easting (metres).
-        centroid_utm_y: Population-weighted centroid northing (metres).
-
-    Returns:
-        (city_name, dist_km, centroid_lat, centroid_lon,
-         city_lat, city_lon, city_in_district)
-    """
-    centroid_lat, centroid_lon = utm_to_latlon(centroid_utm_x, centroid_utm_y)
-    district_radius_m = math.sqrt(district_geom.area / math.pi)
-
-    best_score = -1.0
-    best_inside: tuple | None = None
-
-    fallback_dist_m = float("inf")
-    fallback: tuple | None = None
-
-    for city, clat, clon, cpop in STATE_CITIES:
-        city_utm_x, city_utm_y = latlon_to_utm(clat, clon)
-        dist_m = math.hypot(city_utm_x - centroid_utm_x, city_utm_y - centroid_utm_y)
-
-        if district_geom.contains(Point(city_utm_x, city_utm_y)):
-            score = math.log(max(cpop, 1)) * math.exp(-dist_m / district_radius_m)
-            if score > best_score:
-                best_score = score
-                best_inside = (city, round(dist_m / 1000, 1),
-                               centroid_lat, centroid_lon, clat, clon, True)
-        else:
-            if dist_m < fallback_dist_m:
-                fallback_dist_m = dist_m
-                fallback = (city, round(dist_m / 1000, 1),
-                            centroid_lat, centroid_lon, clat, clon, False)
-
-    if best_inside is not None:
-        return best_inside
-    return fallback or ("Unknown", 0.0, centroid_lat, centroid_lon,
-                        centroid_lat, centroid_lon, False)
-
 summary_rows = []
 city_outside_warnings = []
 for d in range(N_DISTRICTS):
@@ -1107,32 +1020,6 @@ if city_outside_warnings:
     log.warning(f"  ⚠ No city inside district boundary (fallback used): {', '.join(city_outside_warnings)}")
 summary_df = pd.DataFrame(summary_rows)
 
-
-# ── State boundary helpers (used by Stage 8) ──────────────────
-
-def load_tiger_state_boundary(fips: str, target_crs) -> gpd.GeoSeries:
-    """Return the official Census TIGER state boundary reprojected to target_crs.
-
-    Downloads tl_2020_us_state.zip once into data/states/ and caches the
-    extracted shapefile.  Subsequent calls skip the download.
-
-    Args:
-        fips: Two-digit state FIPS code (e.g. "08" for Colorado).
-        target_crs: CRS to reproject into — must match the census block data.
-
-    Returns:
-        GeoSeries with one Polygon or MultiPolygon for the state boundary.
-    """
-    os.makedirs(STATES_DIR, exist_ok=True)
-    if not os.path.exists(TIGER_STATE_SHP):
-        log.info("  Downloading Census TIGER state boundaries...")
-        urllib.request.urlretrieve(TIGER_STATE_URL, TIGER_STATE_ZIP)
-        with zipfile.ZipFile(TIGER_STATE_ZIP) as z:
-            z.extractall(STATES_DIR)
-        log.info(f"  Extracted to {STATES_DIR}/")
-    states = gpd.read_file(TIGER_STATE_SHP)
-    state  = states[states["STATEFP"] == fips]
-    return gpd.GeoSeries(state.geometry.values, crs=states.crs).to_crs(target_crs)
 
 
 def build_raster_state_mask(state_geometry, query_xy: np.ndarray,
@@ -1518,8 +1405,9 @@ for _i, _d in enumerate(_sorted_d):
         bbox=dict(boxstyle="round,pad=0.15", facecolor="#1A1A2E",
                   alpha=0.80, edgecolor=_d_color, linewidth=0.5), zorder=14)
 
+_dist_label = "District" if N_DISTRICTS == 1 else "Districts"
 ax.set_title(
-    f"{STATE_NAME} — {N_DISTRICTS} Districts ({APPORTIONMENT_YEAR} apportionment)\n"
+    f"{STATE_NAME} — {N_DISTRICTS} {_dist_label} ({APPORTIONMENT_YEAR} apportionment)\n"
     f"Population-Bisecting Splitline {VERSION}  ·  "
     f"Colour = District  ·  Brightness = population density",
     fontsize=12, fontweight="500", color="white", pad=12)
@@ -1539,8 +1427,8 @@ log.info(f"  Saved: {MAP_PNG}")
 
 
 
-# ── Quick-mode exit ──────────────────────────────────────────
-if not FULL_REPORT:
+# ── Quick-mode exit (also covers single-district states) ─────
+if not FULL_REPORT or N_DISTRICTS == 1:
     log.info("=" * 60)
     log.info(f"Done — {STATE_NAME} {VERSION}")
     log.info(f"  Prepared by:     {AUTHOR}")
