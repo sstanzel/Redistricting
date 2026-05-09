@@ -112,7 +112,7 @@ PDF_BLACK = black
 PDF_WHITE = white
 
 # ═══════════════════════════════════════════════════════════════
-STATE_NAME = "Colorado"
+STATE_NAME = "Virginia"
 AUTHOR     = "Steve Stanzel, Boulder CO"
 # ═══════════════════════════════════════════════════════════════
 
@@ -1180,26 +1180,85 @@ _city_theta = [
 # Sort districts CCW by that angle.
 _sorted_d = sorted(range(N_DISTRICTS), key=lambda _d: _city_theta[_d])
 
-# Initialise label angles at each district's city angle (purely radial lines),
-# then relax forward to enforce a minimum angular gap without reordering.
+# ── Pass 1: bidirectional angular relaxation ─────────────────────────────────
+# Initialise label angles at each city's radial angle, then push adjacent pairs
+# apart symmetrically (half-deficit each direction) until all gaps >= min_gap.
+# Bidirectional spreading distributes cluster overlap evenly rather than
+# front-loading it — fixes collisions when several cities share the same bearing.
 _min_gap = 2 * math.pi / N_DISTRICTS * 0.60
-_lbl_a = [_city_theta[_d] for _d in _sorted_d]   # one entry per sorted position
-for _ in range(300):
+_lbl_a = [_city_theta[_d] for _d in _sorted_d]
+for _ in range(500):
     _moved = False
-    for _i in range(1, N_DISTRICTS):
-        _gap = (_lbl_a[_i] - _lbl_a[_i - 1]) % (2 * math.pi)
+    for _i in range(N_DISTRICTS):
+        _j = (_i + 1) % N_DISTRICTS
+        _gap = (_lbl_a[_j] - _lbl_a[_i]) % (2 * math.pi)
         if _gap < _min_gap:
-            _lbl_a[_i] = (_lbl_a[_i - 1] + _min_gap) % (2 * math.pi)
+            _half = (_min_gap - _gap) / 2
+            _lbl_a[_i] = (_lbl_a[_i] - _half) % (2 * math.pi)
+            _lbl_a[_j] = (_lbl_a[_j] + _half) % (2 * math.pi)
             _moved = True
-    # wrap-around: gap from last label back to first (mod 2π)
-    _gap0 = (2 * math.pi + _lbl_a[0] - _lbl_a[-1]) % (2 * math.pi)
-    if _gap0 < _min_gap:
-        _lbl_a[0] = (_lbl_a[-1] + _min_gap) % (2 * math.pi)
-        _moved = True
     if not _moved:
         break
 
+# Re-sort label angles back into the city CCW order.
+# Bidirectional relaxation can push a label past its neighbour (especially
+# when several cities cluster in a narrow arc and the backward push wraps
+# past another label).  Sorting the produced angles and re-assigning them to
+# the city-sorted districts restores the invariant that label positions are in
+# the same CCW order as city positions — which by the non-crossing theorem
+# guarantees no connecting lines cross.
+_lbl_a = sorted(_lbl_a)
+
 _lbl_fs = max(5.0, min(8.0, 70.0 / N_DISTRICTS))
+
+# ── Pass 2: coordinate-space bounding-box overlap check ──────────────────────
+# Angular separation alone doesn't guarantee visual separation — two labels on
+# the same edge of the margin rectangle can be angularly apart but still
+# overlapping if their text is long.  For each adjacent pair, estimate the
+# label box dimensions in map units, detect any box overlap, and nudge angles
+# apart (bidirectionally) until the boxes clear.
+_m_per_pt_x = (_LX1 - _LX0) / (_fig_w_map * 72)   # map metres per typographic point
+_m_per_pt_y = (_LY1 - _LY0) / (_fig_h_map * 72)
+
+def _label_box(idx: int) -> tuple[float, float]:
+    """Half-width and half-height of label box in map units."""
+    _d = _sorted_d[idx]
+    _txt = f"D{_d+1} · {summary_rows[_d]['nearest_city']}"
+    return (len(_txt) * _lbl_fs * 0.55 * _m_per_pt_x / 2,
+            _lbl_fs * 1.6  * _m_per_pt_y / 2)
+
+for _ in range(200):
+    _moved = False
+    for _i in range(N_DISTRICTS):
+        _j = (_i + 1) % N_DISTRICTS
+        _xi, _yi = _box_pt(_lbl_a[_i])
+        _xj, _yj = _box_pt(_lbl_a[_j])
+        _hwi, _hhi = _label_box(_i)
+        _hwj, _hhj = _label_box(_j)
+        _ox = (_hwi + _hwj) - abs(_xj - _xi)   # x overlap (positive = overlap)
+        _oy = (_hhi + _hhj) - abs(_yj - _yi)   # y overlap
+        if _ox > 0 and _oy > 0:
+            # Numerically estimate how much angular change eliminates the tighter overlap.
+            _EPS = 5e-4
+            _xi2, _yi2 = _box_pt((_lbl_a[_i] - _EPS) % (2 * math.pi))
+            _xj2, _yj2 = _box_pt((_lbl_a[_j] + _EPS) % (2 * math.pi))
+            _gain_x = (abs(_xj2 - _xi2) - abs(_xj - _xi)) / _EPS   # metres per radian
+            _gain_y = (abs(_yj2 - _yi2) - abs(_yj - _yi)) / _EPS
+            if abs(_gain_x) >= abs(_gain_y) and abs(_gain_x) > 1.0:
+                _nudge = _ox / abs(_gain_x)
+            elif abs(_gain_y) > 1.0:
+                _nudge = _oy / abs(_gain_y)
+            else:
+                _nudge = 0.008
+            _nudge = max(0.003, min(_nudge, 0.04))
+            _lbl_a[_i] = (_lbl_a[_i] - _nudge) % (2 * math.pi)
+            _lbl_a[_j] = (_lbl_a[_j] + _nudge) % (2 * math.pi)
+            _moved = True
+    if not _moved:
+        break
+
+# Re-sort after Pass 2 for the same reason as after Pass 1.
+_lbl_a = sorted(_lbl_a)
 
 for _i, _d in enumerate(_sorted_d):
     _row     = summary_rows[_d]
