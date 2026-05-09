@@ -216,21 +216,23 @@ CACHE_CSV  = os.path.join(DATA_DIR, "centroids_cache.csv")
 OUTPUT_DIR  = os.path.join("output", f"redistricting_{STATE_SLUG}_{VERSION}")
 ASSETS_DIR  = os.path.join(OUTPUT_DIR, "assets")
 LOGS_DIR    = os.path.join(OUTPUT_DIR, "logs")
-CHECKPOINT  = os.path.join(OUTPUT_DIR, f"checkpoint_{STATE_SLUG}.npy")
+DATA_OUT_DIR = os.path.join(OUTPUT_DIR, "data")
+CHECKPOINT  = os.path.join(DATA_OUT_DIR, f"checkpoint_{STATE_SLUG}.npy")
 
 # Backward-compat: fall back to the previous version's checkpoint if this one is absent
 PREV_VERSION     = f"v{int(VERSION[1:])-1}"
 _PREV_OUT_DIR    = os.path.join("output", f"redistricting_{STATE_SLUG}_{PREV_VERSION}")
-_PREV_CHECKPOINT = os.path.join(_PREV_OUT_DIR, f"checkpoint_{STATE_SLUG}.npy")
+_PREV_CHECKPOINT = os.path.join(_PREV_OUT_DIR, "data", f"checkpoint_{STATE_SLUG}.npy")
 
-os.makedirs(DATA_DIR,   exist_ok=True)
-os.makedirs(STATES_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(ASSETS_DIR, exist_ok=True)
-os.makedirs(LOGS_DIR,   exist_ok=True)
+os.makedirs(DATA_DIR,     exist_ok=True)
+os.makedirs(STATES_DIR,   exist_ok=True)
+os.makedirs(OUTPUT_DIR,   exist_ok=True)
+os.makedirs(ASSETS_DIR,   exist_ok=True)
+os.makedirs(LOGS_DIR,     exist_ok=True)
+os.makedirs(DATA_OUT_DIR, exist_ok=True)
 
 # Output paths — all variables, never hardcoded strings
-# PNGs → ASSETS_DIR  |  CSVs/logs → LOGS_DIR  |  PDFs + checkpoints → OUTPUT_DIR
+# PNGs → ASSETS_DIR  |  CSVs → OUTPUT_DIR  |  logs → LOGS_DIR  |  .npy/.pkl → DATA_OUT_DIR
 MAP_PNG        = os.path.join(ASSETS_DIR, f"districts_{STATE_SLUG}_{VERSION}.png")
 SUMMARY_PNG    = os.path.join(ASSETS_DIR, f"summary_{STATE_SLUG}_{VERSION}.png")
 COMPLEXITY_PNG = os.path.join(ASSETS_DIR, f"census_complexity_{STATE_SLUG}_{VERSION}.png")
@@ -279,7 +281,7 @@ TIGER_STATE_ZIP = os.path.join(STATES_DIR, "tl_2020_us_state.zip")
 TIGER_STATE_SHP = os.path.join(STATES_DIR, "tl_2020_us_state.shp")
 
 # ── Logging ───────────────────────────────────────────────────
-log_path = os.path.join(OUTPUT_DIR,
+log_path = os.path.join(LOGS_DIR,
     f"run_{STATE_SLUG}_{VERSION}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s  %(message)s", datefmt="%H:%M:%S",
@@ -533,7 +535,11 @@ def region_shape_from_indices(indices: np.ndarray) -> Any:
 
 
 # ── Stage 3: Splitline (with checkpoint) ─────────────────────
-_ckpt_path = CHECKPOINT if os.path.exists(CHECKPOINT) else _PREV_CHECKPOINT
+# Also check prev version's root dir (pre-v15 stored checkpoints there, not in data/)
+_prev_ckpt_root = os.path.join(_PREV_OUT_DIR, f"checkpoint_{STATE_SLUG}.npy")
+_ckpt_path = (CHECKPOINT if os.path.exists(CHECKPOINT)
+              else _PREV_CHECKPOINT if os.path.exists(_PREV_CHECKPOINT)
+              else _prev_ckpt_root)
 if os.path.exists(_ckpt_path):
     log.info(f"[Stage 3] Loading checkpoint: {_ckpt_path}")
     ckpt    = np.load(_ckpt_path, allow_pickle=True).item()
@@ -664,11 +670,14 @@ else:
 
 
 # ── Stage 4: Border-swap ──────────────────────────────────────
-SWAP_CHECKPOINT      = os.path.join(OUTPUT_DIR,  f"checkpoint_swap_{STATE_SLUG}.npy")
-_PREV_SWAP_CHECKPOINT = os.path.join(_PREV_OUT_DIR, f"checkpoint_swap_{STATE_SLUG}.npy")
+SWAP_CHECKPOINT       = os.path.join(DATA_OUT_DIR, f"checkpoint_swap_{STATE_SLUG}.npy")
+_PREV_SWAP_CHECKPOINT = os.path.join(_PREV_OUT_DIR, "data", f"checkpoint_swap_{STATE_SLUG}.npy")
 
 _swap_loaded = False
-_swap_ckpt_path = SWAP_CHECKPOINT if os.path.exists(SWAP_CHECKPOINT) else _PREV_SWAP_CHECKPOINT
+_prev_swap_root = os.path.join(_PREV_OUT_DIR, f"checkpoint_swap_{STATE_SLUG}.npy")
+_swap_ckpt_path = (SWAP_CHECKPOINT if os.path.exists(SWAP_CHECKPOINT)
+                   else _PREV_SWAP_CHECKPOINT if os.path.exists(_PREV_SWAP_CHECKPOINT)
+                   else _prev_swap_root)
 if os.path.exists(_swap_ckpt_path):
     log.info(f"[Stage 4] Loading swap checkpoint: {_swap_ckpt_path}")
     labels = np.load(_swap_ckpt_path, allow_pickle=True).item()["labels"]
@@ -723,10 +732,15 @@ log.info(f"  After swap: max dev = {max_dev:.4f}% | {result}")
 
 
 # ── Stage 5: Dissolve ─────────────────────────────────────────
-DISSOLVE_CACHE = os.path.join(OUTPUT_DIR, f"checkpoint_dissolve_{STATE_SLUG}.pkl")
-if _swap_loaded and os.path.exists(DISSOLVE_CACHE):
+DISSOLVE_CACHE = os.path.join(DATA_OUT_DIR, f"checkpoint_dissolve_{STATE_SLUG}.pkl")
+_prev_dissolve_root = os.path.join(_PREV_OUT_DIR, f"checkpoint_dissolve_{STATE_SLUG}.pkl")
+_dissolve_path = (DISSOLVE_CACHE if os.path.exists(DISSOLVE_CACHE)
+                  else os.path.join(_PREV_OUT_DIR, "data", f"checkpoint_dissolve_{STATE_SLUG}.pkl")
+                  if os.path.exists(os.path.join(_PREV_OUT_DIR, "data", f"checkpoint_dissolve_{STATE_SLUG}.pkl"))
+                  else _prev_dissolve_root)
+if _swap_loaded and os.path.exists(_dissolve_path):
     log.info("[Stage 5] Loading cached district shapes...")
-    with open(DISSOLVE_CACHE, "rb") as _f:
+    with open(_dissolve_path, "rb") as _f:
         district_shapes = pickle.load(_f)
 else:
     log.info("[Stage 5] Dissolving district shapes...")
@@ -1892,15 +1906,15 @@ else:
 # ── Stage 11: CSVs ────────────────────────────────────────────
 log.info("[Stage 11] Exporting CSVs...")
 gdf[["GEOID20","POP20","district"]].to_csv(
-    os.path.join(LOGS_DIR, f"block_assignments_{STATE_SLUG}_{VERSION}.csv"),
+    os.path.join(OUTPUT_DIR, f"block_assignments_{STATE_SLUG}_{VERSION}.csv"),
     index=False)
 summary_df.to_csv(
-    os.path.join(LOGS_DIR, f"district_summary_{STATE_SLUG}_{VERSION}.csv"),
+    os.path.join(OUTPUT_DIR, f"district_summary_{STATE_SLUG}_{VERSION}.csv"),
     index=False)
 pd.DataFrame([{k:v for k,v in s.items()
                if k not in ("indices","left_mask","clipped_line")}
               for s in split_log]).to_csv(
-    os.path.join(LOGS_DIR, f"split_log_{STATE_SLUG}_{VERSION}.csv"),
+    os.path.join(OUTPUT_DIR, f"split_log_{STATE_SLUG}_{VERSION}.csv"),
     index=False)
 
 
