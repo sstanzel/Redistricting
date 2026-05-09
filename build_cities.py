@@ -122,15 +122,16 @@ for state_name, info in STATES.items():
 
     for _, row in merged.iterrows():
         all_rows.append({
-            "state": state_name,
-            "city":  row["city"],
-            "lat":   round(row["INTPTLAT"], 4),
-            "lon":   round(row["INTPTLON"], 4),
+            "state":      state_name,
+            "city":       row["city"],
+            "lat":        round(row["INTPTLAT"], 4),
+            "lon":        round(row["INTPTLON"], 4),
+            "population": int(row["population"]),
         })
 
     print(f"  {state_name}: {len(merged)} places")
 
 # ── Write cities.csv ───────────────────────────────────────────
-cities_df = pd.DataFrame(all_rows, columns=["state", "city", "lat", "lon"])
+cities_df = pd.DataFrame(all_rows, columns=["state", "city", "lat", "lon", "population"])
 cities_df.to_csv(OUTPUT_CSV, index=False)
 print(f"\nWrote {len(cities_df)} cities across {len(STATES)} states to {OUTPUT_CSV}")

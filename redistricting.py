@@ -1,7 +1,17 @@
 """
-Fair Redistricting v13
+Population-Bisecting Splitline Redistricting v14
 ======================
-Changes from v12b:
+Changes from v13:
+  - Stage 8 fully redesigned: raster city-lights map replaces scatter plot
+    - np.histogram2d per district → city-lights population density layer
+    - Voronoi nearest-centroid grid for district boundary lines
+    - Official Census TIGER state shapefile for the state outline
+      (eliminates interior white-line artifacts from census block edge mismatches)
+    - State raster mask cached to data/states/state_mask_{FIPS}_{W}x{H}.npy
+  - Dev/district_viz.py sandbox for iterating on visualization (4-panel output)
+  - Multi-state tested: Colorado, Texas, Illinois (PASS); California (FAIL — 52 districts)
+
+Changes from v12b (v13):
   - Multi-state data layout: all downloaded inputs go to data/{FIPS}/
     (zip, extracted blocks/, centroids_cache.csv) — shared across runs,
     never re-downloaded if present
@@ -70,8 +80,10 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.colors as mcolors
 from matplotlib.lines import Line2D
+from matplotlib.path import Path as MplPath
 from shapely.geometry import LineString, Point
 from shapely.ops import unary_union
+from scipy.spatial import cKDTree
 from shapely.wkt import loads as wkt_loads
 from pyproj import Transformer
 from PIL import Image as PILImage
@@ -100,11 +112,11 @@ PDF_BLACK = black
 PDF_WHITE = white
 
 # ═══════════════════════════════════════════════════════════════
-STATE_NAME = "Texas"
+STATE_NAME = "Colorado"
 AUTHOR     = "Steve Stanzel, Boulder CO"
 # ═══════════════════════════════════════════════════════════════
 
-VERSION = "v13"
+VERSION = "v15"
 
 STATES = {
     "Alabama":        {"fips": "01", "districts": 7},
@@ -178,7 +190,9 @@ if _cities_df.empty or STATE_NAME not in _cities_df["state"].values:
     subprocess.run([sys.executable, "build_cities.py"], check=True)
     _cities_df = pd.read_csv(_cities_path)
 _state_rows  = _cities_df[_cities_df["state"] == STATE_NAME].head(N_DISTRICTS * 10)
-STATE_CITIES = list(zip(_state_rows["city"], _state_rows["lat"], _state_rows["lon"]))
+# Include population for scoring; fall back to 1 if the column is absent (pre-rebuild CSV)
+_pop_col = _state_rows["population"].astype(int) if "population" in _state_rows.columns else [1] * len(_state_rows)
+STATE_CITIES = list(zip(_state_rows["city"], _state_rows["lat"], _state_rows["lon"], _pop_col))
 
 FIRST_CUT_ANGLE = 135.0
 ALT_CUT_ANGLE   = 45.0
@@ -195,26 +209,40 @@ else:
 
 STATE_SLUG = STATE_NAME.replace(" ", "_")
 DATA_DIR   = os.path.join("data", STATE_FIPS)
+STATES_DIR = os.path.join("data", "states")   # shared across all states
 ZIP_PATH   = os.path.join(DATA_DIR, f"tl_2020_{STATE_FIPS}_tabblock20.zip")
 SHP_DIR    = os.path.join(DATA_DIR, "blocks")
 CACHE_CSV  = os.path.join(DATA_DIR, "centroids_cache.csv")
-OUTPUT_DIR = os.path.join("output", f"redistricting_{STATE_SLUG}_{VERSION}")
-CHECKPOINT = os.path.join(OUTPUT_DIR, f"checkpoint_{STATE_SLUG}.npy")
+OUTPUT_DIR  = os.path.join("output", f"redistricting_{STATE_SLUG}_{VERSION}")
+ASSETS_DIR  = os.path.join(OUTPUT_DIR, "assets")
+LOGS_DIR    = os.path.join(OUTPUT_DIR, "logs")
+CHECKPOINT  = os.path.join(OUTPUT_DIR, f"checkpoint_{STATE_SLUG}.npy")
 
-os.makedirs(DATA_DIR, exist_ok=True)
+# Backward-compat: fall back to the previous version's checkpoint if this one is absent
+PREV_VERSION     = f"v{int(VERSION[1:])-1}"
+_PREV_OUT_DIR    = os.path.join("output", f"redistricting_{STATE_SLUG}_{PREV_VERSION}")
+_PREV_CHECKPOINT = os.path.join(_PREV_OUT_DIR, f"checkpoint_{STATE_SLUG}.npy")
+
+os.makedirs(DATA_DIR,   exist_ok=True)
+os.makedirs(STATES_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(ASSETS_DIR, exist_ok=True)
+os.makedirs(LOGS_DIR,   exist_ok=True)
 
 # Output paths — all variables, never hardcoded strings
-MAP_PNG        = os.path.join(OUTPUT_DIR, f"districts_{STATE_SLUG}_{VERSION}.png")
-SUMMARY_PNG    = os.path.join(OUTPUT_DIR, f"summary_{STATE_SLUG}_{VERSION}.png")
-COMPLEXITY_PNG = os.path.join(OUTPUT_DIR, f"census_complexity_{STATE_SLUG}_{VERSION}.png")
-BLOCKS_PNG     = os.path.join(OUTPUT_DIR, f"census_blocks_{STATE_SLUG}_{VERSION}.png")
+# PNGs → ASSETS_DIR  |  CSVs/logs → LOGS_DIR  |  PDFs + checkpoints → OUTPUT_DIR
+MAP_PNG        = os.path.join(ASSETS_DIR, f"districts_{STATE_SLUG}_{VERSION}.png")
+SUMMARY_PNG    = os.path.join(ASSETS_DIR, f"summary_{STATE_SLUG}_{VERSION}.png")
+COMPLEXITY_PNG = os.path.join(ASSETS_DIR, f"census_complexity_{STATE_SLUG}_{VERSION}.png")
+BLOCKS_PNG     = os.path.join(ASSETS_DIR, f"census_blocks_{STATE_SLUG}_{VERSION}.png")
+SWAP_PNG       = os.path.join(ASSETS_DIR, f"swap_comparison_{STATE_SLUG}_{VERSION}.png")
+SWAP_ZOOM_PNG  = os.path.join(ASSETS_DIR, f"swap_zoom_{STATE_SLUG}_{VERSION}.png")
+FILLED_PNG     = os.path.join(ASSETS_DIR, f"districts_filled_{STATE_SLUG}_{VERSION}.png")
 REPORT_PDF     = os.path.join(OUTPUT_DIR, f"report_{STATE_SLUG}_{VERSION}.pdf")
-CODE_PDF       = os.path.join(OUTPUT_DIR, f"source_code_{STATE_SLUG}_{VERSION}.pdf")
+CODE_PDF       = os.path.join(OUTPUT_DIR, f"source_code_{VERSION}.pdf")
 
 def process_page_path(n: int) -> str:
-    return os.path.join(OUTPUT_DIR,
-        f"process_page{n}_{STATE_SLUG}_{VERSION}.png")
+    return os.path.join(ASSETS_DIR, f"process_page{n}_{STATE_SLUG}_{VERSION}.png")
 
 MAP_COLORS = [
     "#4E79A7","#F28E2B","#59A14F","#E15759",
@@ -236,7 +264,19 @@ SCATTER_SIZE = 0.3
 # Geographic / geometric constants
 EARTH_RADIUS_KM  = 6371.0  # mean Earth radius for haversine distance
 LINE_EXTEND_M    = 2e6     # half-length (m) for infinite split line before clipping to region
-DISTRICT_SIMPLIFY_M = 5000  # 5 km smoothing applied to district boundaries for display only
+DISTRICT_SIMPLIFY_M = 5000  # 5 km smoothing — kept for process-page vector maps only
+
+# Raster visualization constants — Stage 8 district map
+MAP_RASTER_W    = 1500   # grid width  (pixels)
+MAP_RASTER_H    = 900    # grid height (pixels)
+MAP_RASTER_GAMMA     = 0.8   # brightness gamma: <1 = convex, rural cells stay visible
+MAP_BRIGHT_FLOOR     = 0.35  # minimum brightness for any populated raster cell
+MAP_VORONOI_DIM      = 0.20  # brightness for unpopulated Voronoi fill cells
+
+# Census TIGER national state boundary — downloaded once to data/states/, reused
+TIGER_STATE_URL = "https://www2.census.gov/geo/tiger/TIGER2020/STATE/tl_2020_us_state.zip"
+TIGER_STATE_ZIP = os.path.join(STATES_DIR, "tl_2020_us_state.zip")
+TIGER_STATE_SHP = os.path.join(STATES_DIR, "tl_2020_us_state.shp")
 
 # ── Logging ───────────────────────────────────────────────────
 log_path = os.path.join(OUTPUT_DIR,
@@ -247,7 +287,7 @@ logging.basicConfig(level=logging.INFO,
               logging.FileHandler(log_path, mode="w")])
 log = logging.getLogger()
 log.info("=" * 60)
-log.info(f"Fair Redistricting {VERSION} — {STATE_NAME}")
+log.info(f"Population-Bisecting Splitline Redistricting {VERSION} — {STATE_NAME}")
 log.info(f"  Prepared by: {AUTHOR}")
 log.info(f"  Districts: {N_DISTRICTS} | Depth: {MAX_DEPTH} | "
          f"Per-split tol: {MAX_SPLIT_ERROR*100:.3f}%")
@@ -406,9 +446,14 @@ def goal_seek_angle(
 ) -> tuple[float, np.ndarray, np.ndarray, float, tuple[int, int]]:
     """Find the split-line angle that best achieves the target population ratio.
 
-    Sweeps outward from seed_angle_deg in both directions simultaneously.
-    Accepts the first angle within SEARCH_RADIUS that reaches MAX_SPLIT_ERROR,
-    then falls back to a full 180° sweep if needed.
+    Phase 1 — bidirectional goal-seek: steps delta from 0 to SEARCH_RADIUS.
+    At each delta, both seed+delta and seed-delta are tried.  The first angle
+    that achieves <= MAX_SPLIT_ERROR is returned immediately, so the result is
+    always the angle closest to the seed that meets the tolerance.
+
+    Phase 2 — full brute-force fallback: if no angle within ±SEARCH_RADIUS works,
+    sweeps 0°→179° in order and returns the best found (stopping early if tolerance
+    is met).  This fallback fires frequently on irregular sub-regions.
 
     Args:
         indices: Block indices for this sub-region.
@@ -488,9 +533,10 @@ def region_shape_from_indices(indices: np.ndarray) -> Any:
 
 
 # ── Stage 3: Splitline (with checkpoint) ─────────────────────
-if os.path.exists(CHECKPOINT):
-    log.info(f"[Stage 3] Loading checkpoint: {CHECKPOINT}")
-    ckpt    = np.load(CHECKPOINT, allow_pickle=True).item()
+_ckpt_path = CHECKPOINT if os.path.exists(CHECKPOINT) else _PREV_CHECKPOINT
+if os.path.exists(_ckpt_path):
+    log.info(f"[Stage 3] Loading checkpoint: {_ckpt_path}")
+    ckpt    = np.load(_ckpt_path, allow_pickle=True).item()
     labels  = ckpt["labels"]
     # split_log can't be fully reconstructed from checkpoint (geometry objects)
     # so we rebuild a simplified version for visualization
@@ -542,7 +588,11 @@ else:
         """
         Recursively bisect a set of census blocks into equal-population districts.
         Each cut passes through the population-weighted centroid of the sub-region.
-        Alternates between 135 deg (NW-SE) and 45 deg (NE-SW) seed angles.
+        Seed angles alternate between 135° (NW-SE) and 45° (NE-SW) to prevent
+        successive cuts from all running in the same direction and pinwheeling
+        districts around the population center.  The seed is a goal-seek starting
+        point — the algorithm sweeps ±SEARCH_RADIUS degrees to find the angle that
+        best balances population, so the actual cut rarely lands at exactly 135° or 45°.
         """
         n_total = n_left_d+n_right_d
         if n_total==1: labels[indices]=d_start; return
@@ -614,13 +664,14 @@ else:
 
 
 # ── Stage 4: Border-swap ──────────────────────────────────────
-SWAP_CHECKPOINT = os.path.join(OUTPUT_DIR,
-    f"checkpoint_swap_{STATE_SLUG}.npy")
+SWAP_CHECKPOINT      = os.path.join(OUTPUT_DIR,  f"checkpoint_swap_{STATE_SLUG}.npy")
+_PREV_SWAP_CHECKPOINT = os.path.join(_PREV_OUT_DIR, f"checkpoint_swap_{STATE_SLUG}.npy")
 
 _swap_loaded = False
-if os.path.exists(SWAP_CHECKPOINT):
-    log.info(f"[Stage 4] Loading swap checkpoint: {SWAP_CHECKPOINT}")
-    labels = np.load(SWAP_CHECKPOINT, allow_pickle=True).item()["labels"]
+_swap_ckpt_path = SWAP_CHECKPOINT if os.path.exists(SWAP_CHECKPOINT) else _PREV_SWAP_CHECKPOINT
+if os.path.exists(_swap_ckpt_path):
+    log.info(f"[Stage 4] Loading swap checkpoint: {_swap_ckpt_path}")
+    labels = np.load(_swap_ckpt_path, allow_pickle=True).item()["labels"]
     gdf["district"] = labels
     _swap_loaded = True
     log.info("  Loaded.")
@@ -710,32 +761,69 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(a))
 
 
-def nearest_city(
-    utm_x: float,
-    utm_y: float,
-) -> tuple[str, float, float, float, float, float]:
-    """Find the closest city to a projected coordinate point.
+def representative_city(
+    district_geom,
+    centroid_utm_x: float,
+    centroid_utm_y: float,
+) -> tuple[str, float, float, float, float, float, bool]:
+    """Select the best representative office city for a district.
+
+    Uses Option A: centroid-proximity score (log-population × distance decay).
+    All cities inside the district boundary are evaluated; the highest-scoring
+    one is returned.  Falls back to the nearest outside city only when no
+    qualified city exists inside the boundary.
+
+    Score formula:
+        score = log(city_population) × exp(−distance / district_radius)
+
+    where distance is the Euclidean UTM distance from the city to the
+    population-weighted centroid, and district_radius = sqrt(area / π) —
+    the radius of a circle with the same area as the district.
+
+    This balances two competing goals: pick a city large enough to host a
+    congressional office, but keep it near where the district's people live.
+    A city twice the district radius away must be roughly e² ≈ 7× more
+    populous than the centroid city to outscore it.  A city at the centroid
+    exactly scores the full log(population) with no penalty.
 
     Args:
-        utm_x: Easting in the active projection (meters).
-        utm_y: Northing in the active projection (meters).
+        district_geom: Shapely geometry of the district in EPSG:5070.
+        centroid_utm_x: Population-weighted centroid easting (metres).
+        centroid_utm_y: Population-weighted centroid northing (metres).
 
     Returns:
-        (city_name, distance_km, point_lat, point_lon, city_lat, city_lon)
+        (city_name, dist_km, centroid_lat, centroid_lon,
+         city_lat, city_lon, city_in_district)
     """
-    lat, lon = utm_to_latlon(utm_x, utm_y)
-    best_d = float("inf")
-    best_c = "Unknown"
-    best_clat = lat
-    best_clon = lon
-    for city, clat, clon in STATE_CITIES:
-        d = haversine(lat, lon, clat, clon)
-        if d < best_d:
-            best_d = d
-            best_c = city
-            best_clat = clat
-            best_clon = clon
-    return best_c, round(best_d, 1), lat, lon, best_clat, best_clon
+    centroid_lat, centroid_lon = utm_to_latlon(centroid_utm_x, centroid_utm_y)
+    district_radius_m = math.sqrt(district_geom.area / math.pi)
+
+    best_score = -1.0
+    best_inside: tuple | None = None
+
+    fallback_dist_m = float("inf")
+    fallback: tuple | None = None
+
+    for city, clat, clon, cpop in STATE_CITIES:
+        city_utm_x, city_utm_y = latlon_to_utm(clat, clon)
+        dist_m = math.hypot(city_utm_x - centroid_utm_x, city_utm_y - centroid_utm_y)
+
+        if district_geom.contains(Point(city_utm_x, city_utm_y)):
+            score = math.log(max(cpop, 1)) * math.exp(-dist_m / district_radius_m)
+            if score > best_score:
+                best_score = score
+                best_inside = (city, round(dist_m / 1000, 1),
+                               centroid_lat, centroid_lon, clat, clon, True)
+        else:
+            if dist_m < fallback_dist_m:
+                fallback_dist_m = dist_m
+                fallback = (city, round(dist_m / 1000, 1),
+                            centroid_lat, centroid_lon, clat, clon, False)
+
+    if best_inside is not None:
+        return best_inside
+    return fallback or ("Unknown", 0.0, centroid_lat, centroid_lon,
+                        centroid_lat, centroid_lon, False)
 
 summary_rows = []
 city_outside_warnings = []
@@ -743,28 +831,102 @@ for d in range(N_DISTRICTS):
     idx=np.where(labels==d)[0]; w=pop_all[idx]
     cx=np.average(cx_all[idx],weights=w)
     cy=np.average(cy_all[idx],weights=w)
-    city,dist_km,lat,lon,city_lat,city_lon = nearest_city(cx,cy)
+    city,dist_km,lat,lon,city_lat,city_lon,city_in_district = representative_city(
+        district_shapes.geometry.loc[d], cx, cy)
     city_utm_x, city_utm_y = latlon_to_utm(city_lat, city_lon)
-    city_in_district = district_shapes.geometry.loc[d].contains(Point(city_utm_x, city_utm_y))
     ok="✓" if abs(dev_pct[d])<=MAX_TOTAL_DEV*100 else "✗"
-    outside_flag = "" if city_in_district else "  ⚠ city outside district"
+    outside_flag = "" if city_in_district else "  ⚠ no city inside district — fallback"
     log.info(f"  D{d+1:<3} {pop_stats[d]:>10,} {dev_pct[d]:>+7.3f}%  "
              f"{city:<22} {dist_km:>5.0f}km  {ok}{outside_flag}")
     if not city_in_district:
         city_outside_warnings.append(f"D{d+1}: {city}")
+    area_km2 = district_shapes.geometry.loc[d].area / 1e6   # m² → km²
     summary_rows.append({
         "district":d+1, "population":int(pop_stats[d]),
         "deviation_pct":round(float(dev_pct[d]),4),
         "within_1pct":abs(dev_pct[d])<=MAX_TOTAL_DEV*100,
         "pp_compactness":round(float(pp.iloc[d]),4),
+        "area_km2":round(area_km2, 1),
+        "pop_density_per_km2":round(pop_stats[d] / area_km2, 2),
         "center_lat":lat, "center_lon":lon,
+        "center_utm_x":cx, "center_utm_y":cy,
         "nearest_city":city, "nearest_city_dist_km":dist_km,
+        "city_utm_x":city_utm_x, "city_utm_y":city_utm_y,
         "city_in_district":city_in_district,
     })
 
 if city_outside_warnings:
-    log.warning(f"  ⚠ Nearest city outside district boundaries: {', '.join(city_outside_warnings)}")
+    log.warning(f"  ⚠ No city inside district boundary (fallback used): {', '.join(city_outside_warnings)}")
 summary_df = pd.DataFrame(summary_rows)
+
+
+# ── State boundary helpers (used by Stage 8) ──────────────────
+
+def load_tiger_state_boundary(fips: str, target_crs) -> gpd.GeoSeries:
+    """Return the official Census TIGER state boundary reprojected to target_crs.
+
+    Downloads tl_2020_us_state.zip once into data/states/ and caches the
+    extracted shapefile.  Subsequent calls skip the download.
+
+    Args:
+        fips: Two-digit state FIPS code (e.g. "08" for Colorado).
+        target_crs: CRS to reproject into — must match the census block data.
+
+    Returns:
+        GeoSeries with one Polygon or MultiPolygon for the state boundary.
+    """
+    os.makedirs(STATES_DIR, exist_ok=True)
+    if not os.path.exists(TIGER_STATE_SHP):
+        log.info("  Downloading Census TIGER state boundaries...")
+        urllib.request.urlretrieve(TIGER_STATE_URL, TIGER_STATE_ZIP)
+        with zipfile.ZipFile(TIGER_STATE_ZIP) as z:
+            z.extractall(STATES_DIR)
+        log.info(f"  Extracted to {STATES_DIR}/")
+    states = gpd.read_file(TIGER_STATE_SHP)
+    state  = states[states["STATEFP"] == fips]
+    return gpd.GeoSeries(state.geometry.values, crs=states.crs).to_crs(target_crs)
+
+
+def build_raster_state_mask(state_geometry, query_xy: np.ndarray,
+                             shape: tuple,
+                             cache_path: str | None = None) -> np.ndarray:
+    """Return a boolean raster mask: True where a cell centre is inside the state.
+
+    Tries shapely 2.x vectorized contains (fast GEOS STRtree), falls back to
+    matplotlib Path ray-casting.  Cached to cache_path if provided so subsequent
+    runs (same state, same grid size) skip the computation entirely.
+
+    Args:
+        state_geometry: Shapely Polygon or MultiPolygon for the state.
+        query_xy: (N, 2) array of (x, y) cell-centre coordinates.
+        shape: (H, W) output grid shape.
+        cache_path: Optional .npy file path for caching the result.
+
+    Returns:
+        Boolean ndarray of shape (H, W).
+    """
+    if cache_path and os.path.exists(cache_path):
+        log.info(f"  Using cached state mask: {cache_path}")
+        return np.load(cache_path)
+
+    try:
+        import shapely as _shp
+        pts    = _shp.points(query_xy[:, 0], query_xy[:, 1])
+        inside = _shp.contains(state_geometry, pts).reshape(shape)
+    except Exception:
+        # Fallback: matplotlib Path ray-casting (slower on complex polygons)
+        polys = list(state_geometry.geoms) if state_geometry.geom_type == "MultiPolygon" \
+                else [state_geometry]
+        flat = np.zeros(len(query_xy), dtype=bool)
+        for poly in polys:
+            flat |= MplPath(np.array(poly.exterior.coords)).contains_points(query_xy)
+            for interior in poly.interiors:
+                flat &= ~MplPath(np.array(interior.coords)).contains_points(query_xy)
+        inside = flat.reshape(shape)
+
+    if cache_path:
+        np.save(cache_path, inside)
+    return inside
 
 
 # ── Drawing helpers ───────────────────────────────────────────
@@ -828,91 +990,238 @@ def split_legend_handles(include_dot: bool = True) -> list:
 # ── Stage 8: Final district map ───────────────────────────────
 log.info("[Stage 8] Final district map...")
 
-# Per-block scatter: vivid district colour, global alpha so dense metros glow
-# in their district hue rather than blowing out toward white.
-# Zero-population blocks skipped entirely. Blocks sorted ascending by population
-# so the densest marks render last and sit on top — natural density highlighting.
-def _vivid(hex_color: str) -> tuple[float, float, float]:
-    """Return a dark-background-safe version of hex_color.
+MAP_BG = "#0D1117"
 
-    Pastels and near-grays in MAP_COLORS suit light backgrounds but wash out
-    on dark ones. Boosting saturation to ≥0.75 and value to ≥0.80 makes every
-    district colour vivid without changing its hue.
-    """
+# Vivid colour for each district — boosts saturation/value for dark backgrounds
+def _vivid(hex_color: str) -> tuple[float, float, float]:
+    """Return a dark-background-safe version of hex_color (S≥0.75, V≥0.80)."""
     h, s, v = colorsys.rgb_to_hsv(*mcolors.to_rgb(hex_color))
     return colorsys.hsv_to_rgb(h, max(s, 0.75), max(v, 0.80))
 
 _district_rgb = np.array([_vivid(MAP_COLORS[d % len(MAP_COLORS)]) for d in range(N_DISTRICTS)])
 
-# Per-block scatter matching Stage 7b's sub-pixel dot approach, but coloured by
-# district instead of a heat scale.
-# Key: steep gamma (3.5) on brightness means only the top ~20% of blocks by
-# population produce visible light — identical principle to Stage 7b where the
-# YlOrRd colormap maps low-pop blocks to near-black.
-_pop_mask   = pop_all > 0
-_scat_idx   = np.where(_pop_mask)[0]
-_scat_order = _scat_idx[np.argsort(pop_all[_scat_idx])]  # low-pop first, high-pop on top
+# ── Official state boundary from Census TIGER ─────────────────────────────
+log.info("  Loading official state boundary from Census TIGER...")
+_state_gs   = load_tiger_state_boundary(STATE_FIPS, district_shapes.crs)
+_state_poly = _state_gs.geometry.values[0]
+log.info(f"  State boundary: {_state_poly.geom_type}")
 
-_s_logp   = np.log10(pop_all[_scat_order])
-_s_norm   = (_s_logp - _s_logp.min()) / max(_s_logp.max() - _s_logp.min(), 1e-9)
-_s_bright = np.clip(_s_norm, 0, 1) ** 3.5   # steep: sparse blocks near-black, dense cores vivid
-_scat_rgb = _district_rgb[labels[_scat_order]] * _s_bright[:, np.newaxis]
+# ── Raster grid ───────────────────────────────────────────────────────────
+_W, _H = MAP_RASTER_W, MAP_RASTER_H
+_x_bins = np.linspace(xmin_s, xmax_s, _W + 1)
+_y_bins = np.linspace(ymin_s, ymax_s, _H + 1)
+_xc = (_x_bins[:-1] + _x_bins[1:]) / 2
+_yc = (_y_bins[:-1] + _y_bins[1:]) / 2
+_XX, _YY   = np.meshgrid(_xc, _yc)                           # (_H, _W)
+_query_pts = np.column_stack([_XX.ravel(), _YY.ravel()])     # (_H*_W, 2)
 
-# Simplified district shapes — smooths census-block-edge jaggedness for display.
-# Block assignments (block_assignments_*.csv) still reflect the exact unsimplified
-# geometry used for population counts.
-_simp_geom = district_shapes.geometry.simplify(DISTRICT_SIMPLIFY_M, preserve_topology=True)
-_simp_shapes = district_shapes.copy()
-_simp_shapes.geometry = _simp_geom
-# State outer hull from unsimplified geometry — adjacent districts share exact
-# edges there, so union_all() produces no interior gaps and boundary() returns
-# only the outer perimeter of the state.
-_state_outer = district_shapes.geometry.union_all()
-_state_gs = gpd.GeoSeries([_state_outer], crs=district_shapes.crs)
+# Per-district population grids → city-lights background
+_pixel_rgb = np.zeros((_H, _W, 3))
+_pixel_pop = np.zeros((_H, _W))
+for _d in range(N_DISTRICTS):
+    _dm = (labels == _d) & (pop_all > 0)
+    if not _dm.any():
+        continue
+    _g, _, _ = np.histogram2d(cx_all[_dm], cy_all[_dm],
+                               bins=[_x_bins, _y_bins], weights=pop_all[_dm])
+    _g    = _g.T
+    _beat = _g > _pixel_pop
+    _pixel_pop        = np.where(_beat, _g, _pixel_pop)
+    _pixel_rgb[_beat] = _district_rgb[_d]
 
-MAP_BG = "#0D1117"
+def _brightness(pop_grid: np.ndarray) -> np.ndarray:
+    lp = np.log10(np.maximum(pop_grid, 1))
+    lo, hi = lp.min(), lp.max()
+    b = np.clip(((lp - lo) / max(hi - lo, 1e-9)) ** MAP_RASTER_GAMMA, 0.0, 1.0)
+    return np.where(pop_grid > 0, np.maximum(b, MAP_BRIGHT_FLOOR), 0.0)
 
-fig, ax = plt.subplots(1, 1, figsize=(16, 10))
+_pixel_rgb_lit = _pixel_rgb * _brightness(_pixel_pop)[:, :, np.newaxis]
+
+# ── Voronoi district grid + state mask ────────────────────────────────────
+log.info("  Building Voronoi district grid...")
+_tree = cKDTree(np.column_stack([cx_all, cy_all]))
+_, _nn = _tree.query(_query_pts, k=1, workers=-1)
+_vd   = labels[_nn].reshape(_H, _W)         # every cell → nearest block's district
+
+log.info("  Building state raster mask...")
+_mask_cache = os.path.join(STATES_DIR,
+    f"state_mask_{STATE_FIPS}_{_W}x{_H}.npy")
+_in_state = build_raster_state_mask(_state_poly, _query_pts, (_H, _W), _mask_cache)
+log.info(f"  In-state: {_in_state.sum():,}/{_H*_W:,} cells "
+         f"({100*_in_state.mean():.1f}%)")
+
+# Remove enclosed district islands from the Voronoi grid using hole-filling.
+# After border swaps, some census blocks end up geographically isolated inside a
+# different district — their Voronoi cells form closed loops on the boundary layer.
+# binary_fill_holes closes any region completely surrounded by a single district,
+# regardless of size.  Compute all fills from the original _vd first, then apply
+# once to avoid ordering artifacts between districts.
+from scipy.ndimage import binary_fill_holes as _ndi_fill_holes
+_fill_target = np.full((_H, _W), -1, dtype=np.intp)
+_fill_count   = 0
+for _d in range(N_DISTRICTS):
+    _holes = _ndi_fill_holes(_vd == _d) & (_vd != _d) & _in_state
+    if _holes.any():
+        _fill_target[_holes] = _d
+        _fill_count += int(_holes.sum())
+if _fill_count:
+    _vd = _vd.copy()
+    _vd[_fill_target >= 0] = _fill_target[_fill_target >= 0]
+log.info(f"  Voronoi hole-fill: {_fill_count:,} enclosed pixels reassigned")
+
+# District boundary pixels: 4-connected Voronoi neighbours differ, clipped to state.
+_ch = _vd[:, :-1] != _vd[:, 1:]
+_cv = _vd[:-1, :] != _vd[1:, :]
+_bnd = np.zeros((_H, _W), dtype=bool)
+_bnd[:, :-1] |= _ch;  _bnd[:, 1:]  |= _ch
+_bnd[:-1, :] |= _cv;  _bnd[1:, :]  |= _cv
+_bnd &= _in_state                            # clip — no lines escape the state border
+log.info(f"  Boundary pixels: {_bnd.sum():,}")
+
+# Each boundary pixel gets the vivid colour of its district
+_bnd_rgba = np.zeros((_H, _W, 4))
+_bnd_rgba[_bnd, :3] = _district_rgb[_vd[_bnd]]
+_bnd_rgba[_bnd, 3]  = 1.0
+
+# ── Render ────────────────────────────────────────────────────────────────
+# Figure width is derived from geographic extent so the state is never keystoned.
+_fig_h_map = 10.0
+_fig_w_map = _fig_h_map * (xmax_s - xmin_s) / (ymax_s - ymin_s)
+fig, ax = plt.subplots(1, 1, figsize=(_fig_w_map, _fig_h_map))
 fig.patch.set_facecolor(MAP_BG)
 ax.set_facecolor(MAP_BG)
 
-# Sub-pixel scatter: district colour, brightness by steep gamma → matches Stage 7b aesthetics.
-ax.scatter(cx_all[_scat_order], cy_all[_scat_order],
-           c=_scat_rgb, s=SCATTER_SIZE, alpha=0.6, linewidths=0, zorder=4)
+# Layer 1: city-lights (population density coloured by district)
+ax.imshow(_pixel_rgb_lit, origin="lower",
+          extent=[xmin_s, xmax_s, ymin_s, ymax_s],
+          aspect="equal", interpolation="nearest", zorder=2)
+# Layer 2: coloured district boundary lines (rasterised, no interior islands)
+ax.imshow(_bnd_rgba, origin="lower",
+          extent=[xmin_s, xmax_s, ymin_s, ymax_s],
+          aspect="equal", interpolation="nearest", zorder=3)
+# Layer 3: official state border
+_state_gs.boundary.plot(ax=ax, color="white", linewidth=2.0, zorder=4)
 
-# Odd districts (D1, D3, D5 …) draw their boundary in district colour.
-# Even districts draw no line, so every shared border between an odd and even
-# district carries exactly one coloured line — avoiding the doubled-line noise
-# that would appear if every district drew its own boundary.
-for d in range(N_DISTRICTS):
-    if d % 2 == 0 and d in _simp_shapes.index:  # d is 0-based: 0,2,4… = D1,D3,D5…
-        _simp_shapes.loc[[d]].boundary.plot(
-            ax=ax, color=MAP_COLORS[d % len(MAP_COLORS)], linewidth=1.2, zorder=6
-        )
+# External callout labels: stars on the map at city locations, text labels pulled
+# outside the state border with connecting lines.
+#
+# Label placement uses "radial-angle" positioning: each label is placed on the
+# margin rectangle at the same angle as its city from the state centre.  A line
+# from a label to its own radial direction is purely radial, so two such lines
+# can never cross (radial lines through a common centre don't intersect).
+# When cities cluster at similar angles the labels would overlap, so a 1-D
+# relaxation pass spreads them apart while preserving CCW order.
+#
+# Duplicate cities: when N districts share the same nearest city, their stars
+# would overlap and only one would be visible.  We detect this and offset each
+# star to a small circle so all N are individually visible.
+_sc_x = (xmin_s + xmax_s) / 2
+_sc_y = (ymin_s + ymax_s) / 2
+_sw_m = xmax_s - xmin_s
+_sh_m = ymax_s - ymin_s
+_lb_px = _sw_m * 0.17          # horizontal margin for label zone
+_lb_py = _sh_m * 0.22          # vertical margin
+_LX0 = xmin_s - _lb_px;  _LX1 = xmax_s + _lb_px
+_LY0 = ymin_s - _lb_py;  _LY1 = ymax_s + _lb_py
+_LHW = (_LX1 - _LX0) / 2;  _LHH = (_LY1 - _LY0) / 2
 
-# State outer boundary anchors the shape against the dark background.
-_state_gs.boundary.plot(ax=ax, color="white", linewidth=2.0, zorder=7)
+def _box_pt(theta: float) -> tuple[float, float]:
+    """Intersection of ray at angle theta from label-box centre with box perimeter."""
+    c, s = math.cos(theta), math.sin(theta)
+    if abs(c) < 1e-9:
+        return _sc_x, _sc_y + math.copysign(_LHH, s)
+    if abs(s) < 1e-9:
+        return _sc_x + math.copysign(_LHW, c), _sc_y
+    t = min(_LHW / abs(c), _LHH / abs(s))
+    return _sc_x + t * c, _sc_y + t * s
 
-# District labels: white text, dark semi-transparent pill.
-for d in range(N_DISTRICTS):
-    if d in _simp_shapes.index:
-        c = _simp_shapes.loc[d].geometry.centroid
-        ax.annotate(
-            f"D{d+1} · {summary_rows[d]['nearest_city']}",
-            (c.x, c.y), ha="center", va="center", fontsize=6.5, fontweight="500",
-            color="white",
-            bbox=dict(boxstyle="round,pad=0.2", facecolor="#1A1A2E",
-                      alpha=0.75, edgecolor="none"), zorder=9)
+# ── Step 1: jitter stars for duplicate cities ─────────────────────────────
+# Group districts by rounded city coordinates; offset stars in a small circle
+# so every district gets a distinct visible star.
+_STAR_JITTER_M = 12_000   # 12 km jitter radius
+_star_xy: dict[int, tuple[float, float]] = {}
+_coord_groups: dict[tuple, list] = {}
+for _d in range(N_DISTRICTS):
+    _key = (round(summary_rows[_d]['city_utm_x'], -3),
+            round(summary_rows[_d]['city_utm_y'], -3))
+    _coord_groups.setdefault(_key, []).append(_d)
+for _key, _ds in _coord_groups.items():
+    _bx = summary_rows[_ds[0]]['city_utm_x']
+    _by = summary_rows[_ds[0]]['city_utm_y']
+    if len(_ds) == 1:
+        _star_xy[_ds[0]] = (_bx, _by)
+    else:
+        for _ji, _d in enumerate(_ds):
+            _ja = math.pi / 2 + 2 * math.pi * _ji / len(_ds)   # start at top, go CCW
+            _star_xy[_d] = (_bx + _STAR_JITTER_M * math.cos(_ja),
+                            _by + _STAR_JITTER_M * math.sin(_ja))
+
+# ── Step 2: radial-angle label placement with 1-D relaxation ─────────────
+# Compute each city's radial angle from the state bounding-box centre.
+_city_theta = [
+    (math.atan2(summary_rows[_d]['city_utm_y'] - _sc_y,
+                summary_rows[_d]['city_utm_x'] - _sc_x) + 2 * math.pi) % (2 * math.pi)
+    for _d in range(N_DISTRICTS)
+]
+# Sort districts CCW by that angle.
+_sorted_d = sorted(range(N_DISTRICTS), key=lambda _d: _city_theta[_d])
+
+# Initialise label angles at each district's city angle (purely radial lines),
+# then relax forward to enforce a minimum angular gap without reordering.
+_min_gap = 2 * math.pi / N_DISTRICTS * 0.60
+_lbl_a = [_city_theta[_d] for _d in _sorted_d]   # one entry per sorted position
+for _ in range(300):
+    _moved = False
+    for _i in range(1, N_DISTRICTS):
+        _gap = (_lbl_a[_i] - _lbl_a[_i - 1]) % (2 * math.pi)
+        if _gap < _min_gap:
+            _lbl_a[_i] = (_lbl_a[_i - 1] + _min_gap) % (2 * math.pi)
+            _moved = True
+    # wrap-around: gap from last label back to first (mod 2π)
+    _gap0 = (2 * math.pi + _lbl_a[0] - _lbl_a[-1]) % (2 * math.pi)
+    if _gap0 < _min_gap:
+        _lbl_a[0] = (_lbl_a[-1] + _min_gap) % (2 * math.pi)
+        _moved = True
+    if not _moved:
+        break
+
+_lbl_fs = max(5.0, min(8.0, 70.0 / N_DISTRICTS))
+
+for _i, _d in enumerate(_sorted_d):
+    _row     = summary_rows[_d]
+    _d_color = MAP_COLORS[_d % len(MAP_COLORS)]
+    _csx, _csy = _star_xy[_d]
+
+    # Star at (possibly jittered) city location
+    ax.plot(_csx, _csy, marker='*', linestyle='none', color='black', markersize=14, zorder=10)
+    ax.plot(_csx, _csy, marker='*', linestyle='none', color=_d_color, markersize=11,
+            markeredgecolor='white', markeredgewidth=0.7, zorder=11)
+
+    # Label on the margin rectangle at the relaxed radial angle
+    _lx, _ly = _box_pt(_lbl_a[_i])
+    _on_r = _lx > _LX0 + (_LX1 - _LX0) * 0.92
+    _on_l = _lx < _LX0 + (_LX1 - _LX0) * 0.08
+    _ha = 'left' if _on_r else ('right' if _on_l else 'center')
+    _va = 'center' if (_on_r or _on_l) else ('bottom' if _ly > _sc_y else 'top')
+
+    ax.plot([_lx, _csx], [_ly, _csy], color='white', linewidth=0.5, alpha=0.45, zorder=9)
+    ax.annotate(
+        f"D{_d+1} · {_row['nearest_city']}",
+        (_lx, _ly), ha=_ha, va=_va, fontsize=_lbl_fs, fontweight="500", color="white",
+        bbox=dict(boxstyle="round,pad=0.15", facecolor="#1A1A2E",
+                  alpha=0.80, edgecolor=_d_color, linewidth=0.5), zorder=14)
 
 ax.set_title(
     f"{STATE_NAME} — {N_DISTRICTS} Districts ({APPORTIONMENT_YEAR} apportionment)\n"
     f"Population-Bisecting Splitline {VERSION}  ·  "
-    f"Color = District  ·  Brightness = population density  ·  Odd districts outlined",
+    f"Colour = District  ·  Brightness = population density",
     fontsize=12, fontweight="500", color="white", pad=12)
-set_state_bounds(ax)
+# Expand view to include the label margin zone
+ax.set_xlim(_LX0 - _lb_px * 0.1, _LX1 + _lb_px * 0.1)
+ax.set_ylim(_LY0 - _lb_py * 0.1, _LY1 + _lb_py * 0.1)
 
 plt.suptitle(
-    f"{STATE_NAME} Fair Redistricting {VERSION}  |  "
+    f"{STATE_NAME} Population-Bisecting Splitline Redistricting {VERSION}  |  "
     f"Pop: {total_pop:,}  |  Target: {target_pop:,.0f}/district  |  "
     f"Max deviation: {max_dev:.4f}%  |  {result}",
     fontsize=11, fontweight="500", color="white", y=1.01)
@@ -967,7 +1276,7 @@ else:
     fig_cx.patch.set_facecolor("#1A1A2E")
     ax_cx.set_facecolor("#1A1A2E")
     gdf.plot(ax=ax_cx, facecolor="none", edgecolor="white",
-             linewidth=0.08, alpha=0.06)
+             linewidth=0.15, alpha=0.20)
     ax_cx.set_title(
         f"{STATE_NAME} — {n_blocks:,} Census Block Boundaries\n"
         "Each line is one block edge  ·  Lines stack in cities to reveal density",
@@ -992,7 +1301,7 @@ else:
     _rhw = _sw * 0.07
 
     _city_utms = []
-    for _ic, _ilat, _ilon in STATE_CITIES[:min(30, len(STATE_CITIES))]:
+    for _ic, _ilat, _ilon, *_ in STATE_CITIES[:min(30, len(STATE_CITIES))]:
         _iux, _iuy = latlon_to_utm(_ilat, _ilon)
         _city_utms.append((_ic, _iux, _iuy))
 
@@ -1005,14 +1314,25 @@ else:
 
     _all_cux = [x for _, x, _ in _city_utms]
     _all_cuy = [y for _, _, y in _city_utms]
+    _blk_cx  = gdf["cx"].values
+    _blk_cy  = gdf["cy"].values
+
+    # Only consider rural candidates where census blocks actually exist in the
+    # inset region — bounding-box corners can be outside the state boundary.
     _best_rd = 0
     _R_x, _R_y = (xmin_s + xmax_s) / 2, (ymin_s + ymax_s) / 2
     for _gi in range(25):
         for _gj in range(20):
             _gx = xmin_s + (_gi + 0.5) * _sw / 25
             _gy = ymin_s + (_gj + 0.5) * _sh / 20
-            _md = min(math.sqrt((_gx - _cx) ** 2 + (_gy - _cy) ** 2)
-                      for _cx, _cy in zip(_all_cux, _all_cuy))
+            _has_blks = (
+                (_blk_cx >= _gx - _rhw) & (_blk_cx <= _gx + _rhw) &
+                (_blk_cy >= _gy - _rhw) & (_blk_cy <= _gy + _rhw)
+            ).any()
+            if not _has_blks:
+                continue
+            _md = min(math.sqrt((_gx - _ccx) ** 2 + (_gy - _ccy) ** 2)
+                      for _ccx, _ccy in zip(_all_cux, _all_cuy))
             if _md > _best_rd:
                 _best_rd = _md
                 _R_x, _R_y = _gx, _gy
@@ -1024,7 +1344,25 @@ else:
 
     A_X0, A_X1, A_Y0, A_Y1 = _clamp_box(_A_x, _A_y, _uhw)
     B_X0, B_X1, B_Y0, B_Y1 = _clamp_box(_B_x, _B_y, _uhw)
-    R_X0, R_X1, R_Y0, R_Y1 = _clamp_box(_R_x, _R_y, _rhw)
+    # Fit rural box to the actual extent of blocks in the region, not the
+    # full search radius — otherwise irregular state shapes leave the inset mostly empty.
+    _r_in_rgn = (
+        (_blk_cx >= _R_x - _rhw) & (_blk_cx <= _R_x + _rhw) &
+        (_blk_cy >= _R_y - _rhw) & (_blk_cy <= _R_y + _rhw)
+    )
+    if _r_in_rgn.any():
+        _r_bx = _blk_cx[_r_in_rgn];  _r_by = _blk_cy[_r_in_rgn]
+        _r_hw = max(
+            (_r_bx.max() - _r_bx.min()) * 0.58,
+            (_r_by.max() - _r_by.min()) * 0.58,
+            15_000,   # 15 km minimum so a few whole blocks are always visible
+        )
+        R_X0, R_X1, R_Y0, R_Y1 = _clamp_box(
+            float((_r_bx.max() + _r_bx.min()) / 2),
+            float((_r_by.max() + _r_by.min()) / 2),
+            _r_hw)
+    else:
+        R_X0, R_X1, R_Y0, R_Y1 = _clamp_box(_R_x, _R_y, _rhw)
     log.info(f"  Insets: [A] {_A_name}  [B] {_B_name}  [C] Rural area")
 
     fig_b, ax_b = plt.subplots(figsize=(16, 10))
@@ -1047,7 +1385,8 @@ else:
         rect = mpatches.Rectangle((x0, y0), x1 - x0, y1 - y0,
                                    linewidth=2, edgecolor=col, facecolor="none", zorder=8)
         ax_b.add_patch(rect)
-        ax_b.annotate(f"[{letter}] {lbl}", (x0 + (x1 - x0) / 2, y1 + _uhw * 0.2),
+        _label_gap = (y1 - y0) * 0.08   # offset scales with the box, not hardcoded to city size
+        ax_b.annotate(f"[{letter}] {lbl}", (x0 + (x1 - x0) / 2, y1 + _label_gap),
                       ha="center", va="bottom", fontsize=9,
                       color=col, fontweight="bold", zorder=9)
 
@@ -1142,65 +1481,261 @@ else:
                    facecolor=fig_b2.get_facecolor())
     plt.close()
 
+    # ── Histogram: block population distribution ─────────────────
+    _pop_all  = gdf["POP20"].values
+    _h_edges  = [0, 1, 10, 50, 200, 500, 1_000, 2_500, 5_000, 10_000, np.inf]
+    _h_labels = ["0", "1–9", "10–49", "50–199", "200–499", "500–999",
+                 "1K–2.5K", "2.5K–5K", "5K–10K", "10K+"]
+    _h_counts = np.array([
+        int(((_pop_all >= _h_edges[i]) & (_pop_all < _h_edges[i + 1])).sum())
+        for i in range(len(_h_labels))
+    ])
+    _h_pops = np.array([
+        int(_pop_all[(_pop_all >= _h_edges[i]) & (_pop_all < _h_edges[i + 1])].sum())
+        for i in range(len(_h_labels))
+    ])
+    _h_cum = _h_pops.cumsum()
+    _h_total = int(_pop_all.sum())
+
+    fig_hist, ax_hb = plt.subplots(figsize=(16, 4.5))
+    fig_hist.patch.set_facecolor("#1A1A2E")
+    ax_hb.set_facecolor("#0D1B2A")
+    _hx = np.arange(len(_h_labels))
+    _bar_cols = [cmap_b(0.15 + 0.80 * i / max(len(_h_labels) - 1, 1))
+                 for i in range(len(_h_labels))]
+    ax_hb.bar(_hx, _h_counts, color=_bar_cols, edgecolor="#0D1B2A", linewidth=0.5, zorder=3)
+    ax_hb.set_ylabel("Number of Blocks", color="white", fontsize=10)
+    ax_hb.yaxis.set_major_formatter(plt.FuncFormatter(
+        lambda v, _: f"{int(v/1_000)}K" if v >= 1_000 else str(int(v))))
+    ax_hb.tick_params(colors="white")
+    ax_hb.set_xticks(_hx)
+    ax_hb.set_xticklabels(_h_labels, color="white", fontsize=10)
+    ax_hb.set_xlabel("Block Population", color="white", fontsize=10)
+    ax_hb.grid(axis="y", color="#1A2030", linewidth=0.8, zorder=0)
+    for sp in ax_hb.spines.values():
+        sp.set_edgecolor("#333355")
+
+    ax_hr = ax_hb.twinx()
+    ax_hr.plot(_hx, _h_cum, color="#00D4FF", linewidth=2.5,
+               marker="o", markersize=6, zorder=5)
+    ax_hr.fill_between(_hx, _h_cum, alpha=0.10, color="#00D4FF")
+    ax_hr.set_ylim(0, _h_total * 1.08)
+    ax_hr.yaxis.set_major_formatter(plt.FuncFormatter(
+        lambda v, _: f"{v/1_000_000:.1f}M" if v >= 1_000_000 else f"{v/1_000:.0f}K"))
+    ax_hr.set_ylabel("Cumulative Population", color="#00D4FF", fontsize=10)
+    ax_hr.tick_params(colors="#00D4FF")
+    # Annotation at 50% and 100% cumulative
+    for _pct, _col, _lbl in [(0.50, "#FFD700", "50%"), (1.00, "#00D4FF", "100%")]:
+        _tgt = _h_total * _pct
+        ax_hr.axhline(_tgt, color=_col, linewidth=0.9, linestyle="--", alpha=0.55)
+        ax_hr.annotate(f"{_lbl}  {int(_tgt):,}", (_hx[-1] - 0.1, _tgt),
+                       ha="right", va="bottom", color=_col, fontsize=8)
+
+    ax_hb.set_title(
+        f"Block Population Distribution — {blk_stats['n_blocks']:,} blocks total  ·  "
+        f"Bars = block count per range  ·  Blue line = cumulative population",
+        fontsize=10, color="white", fontweight="500", pad=8)
+    plt.tight_layout()
+    blocks_hist_tmp = os.path.join(OUTPUT_DIR, "blocks_hist_tmp.png")
+    fig_hist.savefig(blocks_hist_tmp, dpi=BLOCKS_DPI, bbox_inches="tight",
+                     facecolor=fig_hist.get_facecolor())
+    plt.close()
+
     img_main   = PILImage.open(blocks_main_tmp)
     img_insets = PILImage.open(blocks_insets_tmp)
-    w_combined = max(img_main.width, img_insets.width)
-    combined   = PILImage.new("RGB", (w_combined, img_main.height + img_insets.height), "#1A1A2E")
-    combined.paste(img_main, (0, 0))
+    img_hist   = PILImage.open(blocks_hist_tmp)
+    w_combined = max(img_main.width, img_insets.width, img_hist.width)
+    h_combined = img_main.height + img_insets.height + img_hist.height
+    combined   = PILImage.new("RGB", (w_combined, h_combined), "#1A1A2E")
+    combined.paste(img_main,   (0, 0))
     combined.paste(img_insets, (0, img_main.height))
+    combined.paste(img_hist,   (0, img_main.height + img_insets.height))
     combined.save(BLOCKS_PNG)
     os.remove(blocks_main_tmp)
     os.remove(blocks_insets_tmp)
+    os.remove(blocks_hist_tmp)
     log.info(f"  Saved: {BLOCKS_PNG}")
 
 
-# ── Stage 9: Summary chart ────────────────────────────────────
-log.info("[Stage 9] Summary chart...")
-fig3,axes3=plt.subplots(1,2,figsize=(18,8))
+# ── Stage 9: Summary table ────────────────────────────────────
+log.info("[Stage 9] Summary table...")
+fig3, ax4 = plt.subplots(1, 1, figsize=(10, 0.5 + 0.6 * N_DISTRICTS))
 fig3.patch.set_facecolor("#F8F8F5")
-ax3=axes3[0]; ax3.set_facecolor("#F8F8F5")
-bars=ax3.barh(
-    [f"D{r['district']}: {r['nearest_city']}" for r in summary_rows],
-    [r["population"] for r in summary_rows],
-    color=[MAP_COLORS[(r["district"]-1)%len(MAP_COLORS)] for r in summary_rows],
-    alpha=0.88,edgecolor="white",linewidth=0.8)
-ax3.axvline(target_pop,color="#C0392B",linewidth=1.5,linestyle="--",
-            label=f"Target: {target_pop:,.0f}")
-ax3.axvline(target_pop*(1+MAX_TOTAL_DEV),color="#E67E22",linewidth=1,
-            linestyle=":",alpha=0.7,label="+1% limit")
-ax3.axvline(target_pop*(1-MAX_TOTAL_DEV),color="#E67E22",linewidth=1,
-            linestyle=":",alpha=0.7,label="-1% limit")
-for bar,row in zip(bars,summary_rows):
-    ok="✓" if row["within_1pct"] else "✗"
-    ax3.text(bar.get_width()+5000,bar.get_y()+bar.get_height()/2,
-             f"{row['deviation_pct']:+.3f}% {ok}",va="center",fontsize=9)
-ax3.set_xlabel("Population",fontsize=11)
-ax3.set_title("District Populations by Nearest City",fontsize=12,fontweight="500")
-ax3.legend(fontsize=9); ax3.grid(True,axis="x",alpha=0.3)
-ax4=axes3[1]; ax4.set_axis_off()
-td=[["District","Population","Deviation","Rep. Office Area","Compactness"]]
+ax4.set_facecolor("#F8F8F5")
+ax4.set_axis_off()
+td = [["District", "Population", "Deviation", "Rep. Office Area", "Compactness"]]
 for r in summary_rows:
-    ok="✓" if r["within_1pct"] else "✗"
-    td.append([f"D{r['district']}",f"{r['population']:,}",
+    ok = "✓" if r["within_1pct"] else "✗"
+    td.append([f"D{r['district']}", f"{r['population']:,}",
                f"{r['deviation_pct']:+.3f}% {ok}",
-               f"{r['nearest_city']}\n({r['nearest_city_dist_km']:.0f}km)",
+               f"{r['nearest_city']} ({r['nearest_city_dist_km']:.0f}km)",
                f"{r['pp_compactness']:.3f}"])
-t4=ax4.table(cellText=td[1:],colLabels=td[0],cellLoc="center",loc="center",
-             colWidths=[0.1,0.18,0.18,0.32,0.14])
-t4.auto_set_font_size(False); t4.set_fontsize(9); t4.scale(1,1.8)
-for (r4,c4),cell in t4.get_celld().items():
-    if r4==0: cell.set_facecolor("#1B3A5C"); cell.set_text_props(color="white",fontweight="bold")
-    elif r4%2==0: cell.set_facecolor("#F0F4F8")
-    else: cell.set_facecolor("white")
+t4 = ax4.table(cellText=td[1:], colLabels=td[0], cellLoc="center", loc="center",
+               colWidths=[0.12, 0.20, 0.20, 0.34, 0.14])
+t4.auto_set_font_size(False); t4.set_fontsize(10); t4.scale(1, 2.0)
+for (r4, c4), cell in t4.get_celld().items():
+    if r4 == 0:
+        cell.set_facecolor("#1B3A5C"); cell.set_text_props(color="white", fontweight="bold")
+    elif r4 % 2 == 0:
+        cell.set_facecolor("#F0F4F8")
+    else:
+        cell.set_facecolor("white")
     cell.set_edgecolor("#DDDDDD")
-ax4.set_title("District Summary Table",fontsize=12,fontweight="500",pad=12)
-plt.suptitle(f"{STATE_NAME} Fair Redistricting {VERSION}  |  "
+ax4.set_title("District Summary", fontsize=12, fontweight="500", pad=12)
+plt.suptitle(f"{STATE_NAME} Population-Bisecting Splitline Redistricting {VERSION}  |  "
              f"Max deviation: {max_dev:.4f}% | {result}",
-             fontsize=11,fontweight="500",y=1.01)
+             fontsize=11, fontweight="500", y=1.02)
 plt.tight_layout()
 plt.savefig(SUMMARY_PNG, dpi=MAP_DPI, bbox_inches="tight", facecolor=fig3.get_facecolor())
 plt.close()
 log.info(f"  Saved: {SUMMARY_PNG}")
+
+
+# ── Stage 9b: Swap comparison visualization ───────────────────
+log.info("[Stage 9b] Swap comparison visualization...")
+_need_swap_png = not os.path.exists(SWAP_PNG)
+_need_zoom_png = not os.path.exists(SWAP_ZOOM_PNG)
+if not (_need_swap_png or _need_zoom_png):
+    log.info(f"  Using cached: {SWAP_PNG} and {SWAP_ZOOM_PNG}")
+else:
+    # Pre-swap labels from Stage 3 checkpoint (written before Stage 4 border swaps)
+    _pre_labels = np.load(CHECKPOINT, allow_pickle=True).item()["labels"]
+    _swapped    = _pre_labels != labels
+    _n_swapped  = int(_swapped.sum())
+    log.info(f"  Blocks reassigned by swap: {_n_swapped:,} of {n_blocks:,}")
+
+    # Build pre-swap Voronoi raster, reusing Stage 8 KDTree nearest-neighbour map
+    _vd_pre = _pre_labels[_nn].reshape(_H, _W)
+    _fill_target_pre = np.full((_H, _W), -1, dtype=np.intp)
+    for _d in range(N_DISTRICTS):
+        _holes_pre = _ndi_fill_holes(_vd_pre == _d) & (_vd_pre != _d) & _in_state
+        if _holes_pre.any():
+            _fill_target_pre[_holes_pre] = _d
+    if (_fill_target_pre >= 0).any():
+        _vd_pre = _vd_pre.copy()
+        _vd_pre[_fill_target_pre >= 0] = _fill_target_pre[_fill_target_pre >= 0]
+
+    # Pre-swap city-lights raster: histogram2d from pre-swap labels
+    _pixel_rgb_pre = np.zeros((_H, _W, 3))
+    _pixel_pop_pre = np.zeros((_H, _W))
+    for _d in range(N_DISTRICTS):
+        _dm_pre = (_pre_labels == _d) & (pop_all > 0)
+        if not _dm_pre.any():
+            continue
+        _g_pre, _, _ = np.histogram2d(
+            cx_all[_dm_pre], cy_all[_dm_pre],
+            bins=[_x_bins, _y_bins], weights=pop_all[_dm_pre])
+        _g_pre = _g_pre.T
+        _beat_pre = _g_pre > _pixel_pop_pre
+        _pixel_pop_pre             = np.where(_beat_pre, _g_pre, _pixel_pop_pre)
+        _pixel_rgb_pre[_beat_pre]  = _district_rgb[_d]
+    _pixel_rgb_lit_pre = _pixel_rgb_pre * _brightness(_pixel_pop_pre)[:, :, np.newaxis]
+
+    # Pre-swap coloured district boundary lines
+    _ch_pre = _vd_pre[:, :-1] != _vd_pre[:, 1:]
+    _cv_pre = _vd_pre[:-1, :] != _vd_pre[1:, :]
+    _bnd_pre = np.zeros((_H, _W), dtype=bool)
+    _bnd_pre[:, :-1] |= _ch_pre;  _bnd_pre[:, 1:]  |= _ch_pre
+    _bnd_pre[:-1, :] |= _cv_pre;  _bnd_pre[1:, :]  |= _cv_pre
+    _bnd_pre &= _in_state
+    _bnd_rgba_pre = np.zeros((_H, _W, 4))
+    _bnd_rgba_pre[_bnd_pre, :3] = _district_rgb[_vd_pre[_bnd_pre]]
+    _bnd_rgba_pre[_bnd_pre, 3]  = 1.0
+
+    if _need_swap_png:
+        # State-level side-by-side comparison — dark background, geographic aspect
+        _fig_h_sw = 10.0
+        _fig_w_sw = _fig_h_sw * (xmax_s - xmin_s) / (ymax_s - ymin_s)
+        fig_sw, axes_sw = plt.subplots(1, 2, figsize=(2 * _fig_w_sw + 0.3, _fig_h_sw))
+        fig_sw.patch.set_facecolor(MAP_BG)
+
+        _ax_l = axes_sw[0]
+        _ax_l.set_facecolor(MAP_BG)
+        _ax_l.imshow(_pixel_rgb_lit_pre, origin="lower",
+                     extent=[xmin_s, xmax_s, ymin_s, ymax_s],
+                     aspect="equal", interpolation="nearest", zorder=2)
+        _ax_l.imshow(_bnd_rgba_pre, origin="lower",
+                     extent=[xmin_s, xmax_s, ymin_s, ymax_s],
+                     aspect="equal", interpolation="nearest", zorder=3)
+        _state_gs.boundary.plot(ax=_ax_l, color="white", linewidth=1.5, zorder=4)
+        draw_clipped_splits(_ax_l, split_log)
+        set_state_bounds(_ax_l)
+        _ax_l.set_axis_off()
+        _ax_l.set_title(
+            "Splitlines Only\nStraight geometric cuts before census-block refinement",
+            fontsize=11, fontweight="500", color="white", pad=8)
+
+        _ax_r = axes_sw[1]
+        _ax_r.set_facecolor(MAP_BG)
+        _ax_r.imshow(_pixel_rgb_lit, origin="lower",
+                     extent=[xmin_s, xmax_s, ymin_s, ymax_s],
+                     aspect="equal", interpolation="nearest", zorder=2)
+        _ax_r.imshow(_bnd_rgba, origin="lower",
+                     extent=[xmin_s, xmax_s, ymin_s, ymax_s],
+                     aspect="equal", interpolation="nearest", zorder=3)
+        _state_gs.boundary.plot(ax=_ax_r, color="white", linewidth=1.5, zorder=4)
+        set_state_bounds(_ax_r)
+        _ax_r.set_axis_off()
+        _ax_r.set_title(
+            "After Border-Swap Refinement\nFinal boundaries follow census block edges",
+            fontsize=11, fontweight="500", color="white", pad=8)
+
+        plt.suptitle(
+            f"{STATE_NAME} — Border-Swap Refinement  |  "
+            f"{_n_swapped:,} of {n_blocks:,} blocks reassigned",
+            fontsize=11, fontweight="500", color="white", y=1.01)
+        plt.tight_layout()
+        plt.savefig(SWAP_PNG, dpi=MAP_DPI, bbox_inches="tight",
+                    facecolor=fig_sw.get_facecolor())
+        plt.close()
+        log.info(f"  Saved: {SWAP_PNG}")
+
+    if _need_zoom_png:
+        # Zoom into the 60km grid cell with the most swapped blocks
+        _zoom_cell = 60_000  # metres
+        _xi_g = np.floor((cx_all - xmin_s) / _zoom_cell).astype(int)
+        _yi_g = np.floor((cy_all - ymin_s) / _zoom_cell).astype(int)
+        _cell_keys = _xi_g * 100000 + _yi_g
+        _sw_counts: dict[int, int] = {}
+        for _ck in _cell_keys[_swapped]:
+            _sw_counts[_ck] = _sw_counts.get(_ck, 0) + 1
+        if _sw_counts:
+            _best_ck = max(_sw_counts, key=_sw_counts.get)
+            _bxi_g, _byi_g = _best_ck // 100000, _best_ck % 100000
+            _zcx = xmin_s + (_bxi_g + 0.5) * _zoom_cell
+            _zcy = ymin_s + (_byi_g + 0.5) * _zoom_cell
+            log.info(f"  Zoom centre: ({_zcx/1000:.0f}, {_zcy/1000:.0f}) km  "
+                     f"({_sw_counts[_best_ck]} swapped blocks in peak cell)")
+        else:
+            _zcx = float(np.median(cx_all[_swapped]))
+            _zcy = float(np.median(cy_all[_swapped]))
+        _zr = 80_000   # 80 km radius — shows enough context around the swap zone
+        _zx0, _zx1 = _zcx - _zr, _zcx + _zr
+        _zy0, _zy1 = _zcy - _zr, _zcy + _zr
+
+        fig_zoom, ax_zoom = plt.subplots(1, 1, figsize=(10, 10))
+        fig_zoom.patch.set_facecolor(MAP_BG)
+        ax_zoom.set_facecolor(MAP_BG)
+        ax_zoom.imshow(_pixel_rgb_lit, origin="lower",
+                       extent=[xmin_s, xmax_s, ymin_s, ymax_s],
+                       aspect="equal", interpolation="nearest", zorder=2)
+        ax_zoom.imshow(_bnd_rgba, origin="lower",
+                       extent=[xmin_s, xmax_s, ymin_s, ymax_s],
+                       aspect="equal", interpolation="nearest", zorder=3)
+        _state_gs.boundary.plot(ax=ax_zoom, color="white", linewidth=2.0, zorder=4)
+        draw_clipped_splits(ax_zoom, split_log)
+        ax_zoom.set_xlim(_zx0, _zx1)
+        ax_zoom.set_ylim(_zy0, _zy1)
+        ax_zoom.set_axis_off()
+        ax_zoom.set_title(
+            f"{STATE_NAME} — Splitlines vs. Final Block Boundaries (zoomed)\n"
+            "Lines = original bisections  ·  Jagged edges = census block boundaries after swapping",
+            fontsize=11, fontweight="500", color="white", pad=8)
+        plt.tight_layout()
+        plt.savefig(SWAP_ZOOM_PNG, dpi=MAP_DPI, bbox_inches="tight",
+                    facecolor=fig_zoom.get_facecolor())
+        plt.close()
+        log.info(f"  Saved: {SWAP_ZOOM_PNG}")
 
 
 # ── Stage 10: Process pages ───────────────────────────────────
@@ -1208,92 +1743,164 @@ log.info("[Stage 10] Process pages...")
 n_splits=len(split_log); n_pages=math.ceil(n_splits/2)
 
 for page in range(n_pages):
-    fig2,axes2=plt.subplots(1,2,figsize=(22,11))
+    fig2, axes2 = plt.subplots(1, 2, figsize=(22, 11))
     fig2.patch.set_facecolor("#F8F8F5")
     for col in range(2):
-        split_idx=page*2+col
-        ax=axes2[col]
-        if split_idx>=n_splits:
+        split_idx = page * 2 + col
+        ax = axes2[col]
+        if split_idx >= n_splits:
+            # ── Final state panel ──────────────────────────────────
             ax.set_facecolor("#D6EAF8")
             for d in range(N_DISTRICTS):
                 if d in district_shapes.index:
                     district_shapes.loc[[d]].plot(ax=ax,
-                        color=MAP_COLORS[d%len(MAP_COLORS)],linewidth=0,alpha=0.90)
-            district_shapes.boundary.plot(ax=ax,color="white",linewidth=1.8)
-            draw_clipped_splits(ax,split_log)
+                        color=MAP_COLORS[d % len(MAP_COLORS)], linewidth=0, alpha=0.90)
+            district_shapes.boundary.plot(ax=ax, color="white", linewidth=1.8)
+            draw_clipped_splits(ax, split_log)
             for d in range(N_DISTRICTS):
                 if d in district_shapes.index:
-                    c=district_shapes.loc[d].geometry.centroid
+                    c = district_shapes.loc[d].geometry.centroid
                     ax.annotate(f"D{d+1}\n{pop_stats[d]/1000:.0f}k",
-                                (c.x,c.y),ha="center",va="center",fontsize=8,
+                                (c.x, c.y), ha="center", va="center", fontsize=8,
                                 fontweight="500",
-                                bbox=dict(boxstyle="round,pad=0.3",facecolor="white",
-                                          alpha=0.88,edgecolor="none"),zorder=9)
+                                bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                                          alpha=0.88, edgecolor="none"), zorder=9)
             ax.set_title(f"Final — {N_DISTRICTS} Districts\n"
                          f"Max deviation: {max_dev:.4f}% | {result}",
-                         fontsize=14,fontweight="500",pad=12)
+                         fontsize=14, fontweight="500", pad=12)
+            set_state_bounds(ax)
         else:
-            s=split_log[split_idx]
-            splits_so_far=split_log[:split_idx+1]
+            # ── Split panel: zoomed to sub-region ──────────────────
+            s = split_log[split_idx]
+            splits_so_far = split_log[:split_idx + 1]
+
+            # Compute zoom bounds from this sub-region's block centroids
+            rcx = cx_all[s["indices"]]; rcy = cy_all[s["indices"]]
+            rpx = max((rcx.max() - rcx.min()) * 0.10, 30000)
+            rpy = max((rcy.max() - rcy.min()) * 0.10, 30000)
+            zx0, zx1 = rcx.min() - rpx, rcx.max() + rpx
+            zy0, zy1 = rcy.min() - rpy, rcy.max() + rpy
+
             ax.set_facecolor("#D6EAF8")
             for d in range(N_DISTRICTS):
                 if d in district_shapes.index:
-                    district_shapes.loc[[d]].plot(ax=ax,color="#E8E8E8",
-                                                   linewidth=0,alpha=0.5)
-            district_shapes.boundary.plot(ax=ax,color="#CCCCCC",
-                                          linewidth=0.4,alpha=0.6)
-            side_a=s["indices"][s["left_mask"]]
-            side_b=s["indices"][~s["left_mask"]]
-            ax.scatter(cx_all[side_a],cy_all[side_a],c="#5B9BD5",
-                       s=1.0,alpha=0.55,linewidths=0,zorder=2)
-            ax.scatter(cx_all[side_b],cy_all[side_b],c="#E8785A",
-                       s=1.0,alpha=0.55,linewidths=0,zorder=2)
-            draw_clipped_splits(ax,splits_so_far)
-            draw_region_labels(ax,s,fontsize=11)
-            side_leg=[
-                mpatches.Patch(facecolor="#5B9BD5",alpha=0.7,
-                               label=f"Side A: {s['pop_left']/1000:.0f}k"),
-                mpatches.Patch(facecolor="#E8785A",alpha=0.7,
-                               label=f"Side B: {s['pop_right']/1000:.0f}k"),
+                    district_shapes.loc[[d]].plot(ax=ax, color="#E8E8E8",
+                                                   linewidth=0, alpha=0.5)
+            district_shapes.boundary.plot(ax=ax, color="#CCCCCC",
+                                          linewidth=0.4, alpha=0.6)
+            side_a = s["indices"][s["left_mask"]]
+            side_b = s["indices"][~s["left_mask"]]
+            ax.scatter(cx_all[side_a], cy_all[side_a], c="#5B9BD5",
+                       s=2.5, alpha=0.65, linewidths=0, zorder=2)
+            ax.scatter(cx_all[side_b], cy_all[side_b], c="#E8785A",
+                       s=2.5, alpha=0.65, linewidths=0, zorder=2)
+            draw_clipped_splits(ax, splits_so_far)
+            draw_region_labels(ax, s, fontsize=11)
+            side_leg = [
+                mpatches.Patch(facecolor="#5B9BD5", alpha=0.7,
+                               label=f"Side A: {s['pop_left']:,}"),
+                mpatches.Patch(facecolor="#E8785A", alpha=0.7,
+                               label=f"Side B: {s['pop_right']:,}"),
             ]
-            ax.legend(handles=side_leg,loc="upper right",
-                      fontsize=8,framealpha=0.9,edgecolor="none")
+            ax.legend(handles=side_leg, loc="upper right",
+                      fontsize=8, framealpha=0.9, edgecolor="none")
+
+            seed_dir = "NW–SE" if s["seed_angle"] == FIRST_CUT_ANGLE else "NE–SW"
+            landed_note = (f"goal-seek from {s['seed_angle']:.0f}° ({seed_dir}) "
+                           f"→ landed {s['angle_deg']:.1f}°"
+                           if abs(s["angle_deg"] - s["seed_angle"]) > 0.9
+                           else f"{s['angle_deg']:.1f}° (matched seed)")
             ax.set_title(
-                f"Split {s['split_num']} of {n_splits}  →  "
-                f"{s['split_num']+1} regions\n"
-                f"Seed: {s['seed_angle']:.0f}° → landed: {s['angle_deg']:.1f}° | "
-                f"Balance error: {s['balance_err']:.4f}% | "
-                f"Side A: {s['pop_left']/1000:.0f}k  ·  "
-                f"Side B: {s['pop_right']/1000:.0f}k\n"
-                f"● = population center of sub-region (bisection anchor)",
-                fontsize=11,fontweight="500",pad=10)
-        set_state_bounds(ax)
+                f"Split {s['split_num']} of {n_splits}  ·  {landed_note}\n"
+                f"Balance error: {s['balance_err']:.3f}%  ·  "
+                f"Side A (teal): {s['pop_left']:,}  ·  Side B (salmon): {s['pop_right']:,}\n"
+                f"● = population-weighted center of this sub-region (bisection anchor)",
+                fontsize=10, fontweight="500", pad=8)
+
+            # Set zoom
+            ax.set_xlim(zx0, zx1)
+            ax.set_ylim(zy0, zy1)
+            ax.set_axis_off()
+
+            # Locator inset — bottom-right, shows where this sub-region sits in the state
+            ax_loc = ax.inset_axes([0.77, 0.02, 0.21, 0.21])
+            ax_loc.set_facecolor("#D6EAF8")
+            for d in range(N_DISTRICTS):
+                if d in district_shapes.index:
+                    district_shapes.loc[[d]].plot(
+                        ax=ax_loc, color="#C0CEDE", linewidth=0, aspect=None)
+            # Highlight the sub-region being split
+            ax_loc.scatter(rcx, rcy, c="#4A7EB5", s=0.2, linewidths=0, alpha=0.7, zorder=2)
+            # Red rectangle showing zoom area
+            ax_loc.add_patch(mpatches.Rectangle(
+                (zx0, zy0), zx1 - zx0, zy1 - zy0,
+                linewidth=1.5, edgecolor="#C0392B", facecolor="#C0392B",
+                alpha=0.20, zorder=3, transform=ax_loc.transData))
+            ax_loc.set_xlim(xmin_s - 15000, xmax_s + 15000)
+            ax_loc.set_ylim(ymin_s - 15000, ymax_s + 15000)
+            ax_loc.set_aspect("equal")
+            ax_loc.set_axis_off()
+            ax_loc.set_title("location", fontsize=6, color="#555555", pad=2)
+
     axes2[0].legend(handles=split_legend_handles(include_dot=True),
-                    loc="lower left",fontsize=8,framealpha=0.92,edgecolor="none")
+                    loc="lower left", fontsize=8, framealpha=0.92, edgecolor="none")
     plt.suptitle(
-        f"{STATE_NAME} Redistricting {VERSION} — Process Page {page+1} of {n_pages}  |  "
-        f"Teal = Side A · Salmon = Side B of bisecting line  |  "
-        f"● = Population center before bisection",
-        fontsize=11,fontweight="500",y=1.01)
+        f"{STATE_NAME} Redistricting {VERSION} — Process Page {page + 1} of {n_pages}  |  "
+        f"Teal = Side A · Salmon = Side B  |  ● = Population center before bisection",
+        fontsize=11, fontweight="500", y=1.01)
     plt.tight_layout()
-    plt.savefig(process_page_path(page+1), dpi=PROCESS_DPI, bbox_inches="tight",
+    plt.savefig(process_page_path(page + 1), dpi=PROCESS_DPI, bbox_inches="tight",
                 facecolor=fig2.get_facecolor())
     plt.close()
-    log.info(f"  Saved: {process_page_path(page+1)}")
+    log.info(f"  Saved: {process_page_path(page + 1)}")
+
+# Standalone solid-color district map — saved separately so it can be viewed directly
+if os.path.exists(FILLED_PNG):
+    log.info(f"  [10] Using cached: {FILLED_PNG}")
+else:
+    log.info(f"  [10] Saving standalone filled district map...")
+    fig_filled, ax_filled = plt.subplots(figsize=(14, 10))
+    fig_filled.patch.set_facecolor("#D6EAF8")
+    ax_filled.set_facecolor("#D6EAF8")
+    for d in range(N_DISTRICTS):
+        if d in district_shapes.index:
+            district_shapes.loc[[d]].plot(ax=ax_filled,
+                color=MAP_COLORS[d % len(MAP_COLORS)], linewidth=0, alpha=0.90)
+    district_shapes.boundary.plot(ax=ax_filled, color="white", linewidth=1.8)
+    draw_clipped_splits(ax_filled, split_log)
+    for d in range(N_DISTRICTS):
+        if d in district_shapes.index:
+            c = district_shapes.loc[d].geometry.centroid
+            ax_filled.annotate(
+                f"D{d+1}\n{pop_stats[d]/1000:.0f}k",
+                (c.x, c.y), ha="center", va="center", fontsize=10,
+                fontweight="500",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                          alpha=0.88, edgecolor="none"), zorder=9)
+    ax_filled.set_title(
+        f"{STATE_NAME} — {N_DISTRICTS} Final Districts\n"
+        f"Max deviation: {max_dev:.4f}% | {result}",
+        fontsize=14, fontweight="500", pad=12)
+    set_state_bounds(ax_filled)
+    plt.tight_layout()
+    fig_filled.savefig(FILLED_PNG, dpi=MAP_DPI, bbox_inches="tight",
+                       facecolor=fig_filled.get_facecolor())
+    plt.close()
+    log.info(f"  Saved: {FILLED_PNG}")
 
 
 # ── Stage 11: CSVs ────────────────────────────────────────────
 log.info("[Stage 11] Exporting CSVs...")
 gdf[["GEOID20","POP20","district"]].to_csv(
-    os.path.join(OUTPUT_DIR,f"block_assignments_{STATE_SLUG}_{VERSION}.csv"),
+    os.path.join(LOGS_DIR, f"block_assignments_{STATE_SLUG}_{VERSION}.csv"),
     index=False)
 summary_df.to_csv(
-    os.path.join(OUTPUT_DIR,f"district_summary_{STATE_SLUG}_{VERSION}.csv"),
+    os.path.join(LOGS_DIR, f"district_summary_{STATE_SLUG}_{VERSION}.csv"),
     index=False)
 pd.DataFrame([{k:v for k,v in s.items()
                if k not in ("indices","left_mask","clipped_line")}
               for s in split_log]).to_csv(
-    os.path.join(OUTPUT_DIR,f"split_log_{STATE_SLUG}_{VERSION}.csv"),
+    os.path.join(LOGS_DIR, f"split_log_{STATE_SLUG}_{VERSION}.csv"),
     index=False)
 
 
@@ -1348,7 +1955,7 @@ code_doc = SimpleDocTemplate(CODE_PDF, pagesize=LETTER_SIZE,
 
 code_story = []
 code_story.append(Paragraph(
-    f"{STATE_NAME} Fair Redistricting — Full Source Code", ps["code_title"]))
+    f"{STATE_NAME} Population-Bisecting Splitline Redistricting — Full Source Code", ps["code_title"]))
 code_story.append(Paragraph(
     f"File: {os.path.basename(script_path)}  |  Version: {VERSION}  |  "
     f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}  |  "
@@ -1369,7 +1976,7 @@ code_story.append(Spacer(1,12))
 code_story.append(HRFlowable(width="100%",thickness=1,
                               color=PDF_MGRAY,spaceAfter=6))
 code_story.append(Paragraph(
-    f"{STATE_NAME} Fair Redistricting {VERSION}  |  Full source code  |  "
+    f"{STATE_NAME} Population-Bisecting Splitline Redistricting {VERSION}  |  Full source code  |  "
     f"Prepared by: {AUTHOR}", ps["code_foot"]))
 
 code_doc.build(code_story)
@@ -1401,12 +2008,24 @@ def req_row(num, rtitle, color, text):
 
 story=[]
 
+# Compute image embed dimensions from actual PNG sizes so the PDF never keystones.
+def _img_embed(path: str, max_w_in: float) -> tuple[float, float]:
+    """Return (width, height) in ReportLab points that fit path within max_w_in inches."""
+    pil_w, pil_h = PILImage.open(path).size
+    w = max_w_in * inch
+    h = w * pil_h / pil_w
+    return w, h
+
+_map_embed_cover   = _img_embed(MAP_PNG, 6.5)   # cover page
+_map_embed_body    = _img_embed(MAP_PNG, 6.8)   # district map section
+_filled_embed      = _img_embed(FILLED_PNG, 6.8)  # solid-color filled district map
+
 # Cover
 story.append(Spacer(1,0.4*inch))
 story.append(Paragraph(f"{STATE_NAME}", ps["title"]))
-story.append(Paragraph("Fair Congressional Redistricting", ps["sub"]))
+story.append(Paragraph("Population-Bisecting Splitline Districting", ps["sub"]))
 story.append(HRFlowable(width="100%",thickness=2,color=PDF_BLUE,spaceAfter=14))
-story.append(RLImage(MAP_PNG,width=6.5*inch,height=2.9*inch))
+story.append(RLImage(MAP_PNG, width=_map_embed_cover[0], height=_map_embed_cover[1]))
 story.append(Spacer(1,14))
 story.append(HRFlowable(width="100%",thickness=1,color=PDF_MGRAY,spaceAfter=10))
 
@@ -1467,7 +2086,7 @@ bsd=[["Metric","Value","Notes"],
      ["Block pop — min",f"{blk_stats['pop_min']:,}","Smallest populated block"],
      ["Block pop — median",f"{blk_stats['pop_median']:.0f}","Half have fewer people"],
      ["Block pop — mean",f"{blk_stats['pop_mean']:.1f}","Average per block"],
-     ["Block pop — max",f"{blk_stats['pop_max']:,}","Densest single block"],]
+     ["Block pop — max",f"{blk_stats['pop_max']:,}","Most populous single block"],]
 bst=Table(bsd,colWidths=[2.2*inch,1.4*inch,3.1*inch])
 bst.setStyle(TableStyle([
     ("BACKGROUND",(0,0),(-1,0),PDF_NAVY),("TEXTCOLOR",(0,0),(-1,0),PDF_WHITE),
@@ -1525,11 +2144,16 @@ for i,(stitle,stext) in enumerate([
      f"right, since the line is diagonal."),
     ("Repeat inside each region",
      f"Find each new region's population center (●) and draw a new bisecting line "
-     f"through it, this time at {ALT_CUT_ANGLE:.0f}° (forward slash /). The angles "
-     f"alternate for visual variety."),
+     f"through it. The seed angle alternates — {FIRST_CUT_ANGLE:.0f}° (NW-SE) for "
+     f"odd-depth cuts, {ALT_CUT_ANGLE:.0f}° (NE-SW) for even-depth cuts — to prevent "
+     f"successive cuts from all running the same direction and pinwheeling districts "
+     f"around the center. Each seed is a goal-seek starting point: the algorithm sweeps "
+     f"up to ±{SEARCH_RADIUS:.0f}° to find the angle that best balances population, so "
+     f"the actual cut angle is rarely exactly {FIRST_CUT_ANGLE:.0f}° or {ALT_CUT_ANGLE:.0f}°."),
     ("Continue until done",
      f"Repeat until {N_DISTRICTS} regions exist, each with ~{target_pop:,.0f} people. "
-     f"All lines meet near the state's population center, creating a pinwheel pattern."),
+     f"The alternating seed directions spread cuts across the compass, so districts "
+     f"radiate outward rather than spiraling."),
 ]):
     story.append(Paragraph(f"Step {i+1}: {stitle}",ps["h2"]))
     story.append(Paragraph(stext,ps["body"]))
@@ -1574,14 +2198,47 @@ story.append(Paragraph("District Results Summary",ps["h1"]))
 story.append(Paragraph(
     f"Max deviation: {max_dev:.4f}%  |  Result: {result}  |  "
     f"Avg compactness (Polsby-Popper): {pp.mean():.3f}",ps["body"]))
-res_d=[["District","Population","Deviation","Rep. Office Area","Compact."]]
+story.append(Paragraph(
+    "<b>Population deviation</b> measures how closely each district matches the "
+    "equal-population ideal. "
+    f"The 2020 Census counted <b>{total_pop:,} residents</b> in {STATE_NAME}. "
+    f"Divided equally among {N_DISTRICTS} congressional districts, the target is "
+    f"<b>{target_pop:,.0f} people per district</b>. "
+    "Deviation is calculated as: "
+    "<i>(district population − target) ÷ target × 100%</i>. "
+    "A positive deviation means the district has more people than the target; "
+    "negative means fewer. "
+    "The constitutional standard for congressional districts requires the maximum "
+    "deviation across all districts to be under 1%, meaning no district may hold "
+    f"more than {target_pop * 1.01:,.0f} or fewer than {target_pop * 0.99:,.0f} "
+    f"residents. {STATE_NAME}'s maximum deviation in this map is {max_dev:.4f}% — "
+    f"{'within' if max_dev <= MAX_TOTAL_DEV * 100 else 'outside'} the 1% threshold.",
+    ps["body"]))
+story.append(Paragraph(
+    "<b>Compactness (Polsby-Popper score)</b> measures how close a district's shape "
+    "is to a circle. The score is computed as 4π × Area ÷ Perimeter². A perfect circle "
+    "scores 1.0; elongated or highly irregular shapes score closer to 0. "
+    f"In {STATE_NAME}, scores range from "
+    f"{min(r['pp_compactness'] for r in summary_rows):.3f} "
+    f"(D{min(summary_rows, key=lambda r: r['pp_compactness'])['district']}, "
+    f"{escape_xml(min(summary_rows, key=lambda r: r['pp_compactness'])['nearest_city'])} area) "
+    f"to "
+    f"{max(r['pp_compactness'] for r in summary_rows):.3f} "
+    f"(D{max(summary_rows, key=lambda r: r['pp_compactness'])['district']}, "
+    f"{escape_xml(max(summary_rows, key=lambda r: r['pp_compactness'])['nearest_city'])} area). "
+    "Because this algorithm draws straight-line splits rather than tracing existing roads or "
+    "county lines, districts tend to be more compact than those drawn by hand.",
+    ps["body"]))
+res_d=[["District","Population","Deviation","Rep. Office Area","Area (km²)","Pop/km²","Compact."]]
 for r in summary_rows:
     ok="✓" if r["within_1pct"] else "✗"
     res_d.append([f"D{r['district']}",f"{r['population']:,}",
                   f"{r['deviation_pct']:+.3f}% {ok}",
                   f"{r['nearest_city']} ({r['nearest_city_dist_km']:.0f}km)",
+                  f"{r['area_km2']:,.0f}",
+                  f"{r['pop_density_per_km2']:.1f}",
                   f"{r['pp_compactness']:.3f}"])
-res_t=Table(res_d,colWidths=[0.7*inch,1.1*inch,1.1*inch,2.5*inch,0.85*inch])
+res_t=Table(res_d,colWidths=[0.6*inch,0.95*inch,0.95*inch,2.0*inch,0.75*inch,0.65*inch,0.75*inch])
 res_t.setStyle(TableStyle([
     ("BACKGROUND",(0,0),(-1,0),PDF_NAVY),("TEXTCOLOR",(0,0),(-1,0),PDF_WHITE),
     ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),9),
@@ -1596,34 +2253,137 @@ story.append(res_t)
 story.append(PageBreak())
 story.append(Paragraph("District Map",ps["h1"]))
 story.append(Paragraph(
-    "Colored districts with proposed representative office cities (★) and "
-    "bisection anchor points (●). Split lines are clipped to their sub-region.",
+    "Colored districts with the proposed representative office city for each district "
+    "marked with a star (★). Brightness reflects population density. "
+    "Each star is placed inside its district boundary.",
     ps["body"]))
-story.append(RLImage(MAP_PNG,width=6.8*inch,height=3.1*inch))
-story.append(Spacer(1,14))
-story.append(Paragraph("Population Summary",ps["h1"]))
 story.append(Paragraph(
-    "District populations vs. target, with proposed representative office city.",
+    "<b>How the representative city is chosen.</b> "
+    "For each district, every city inside the district boundary is scored by: "
+    "<i>score = log(city population) × exp(−distance / district radius)</i>, "
+    "where <i>distance</i> is from the city to the district's population-weighted centroid "
+    "and <i>district radius</i> = √(area / π), the radius of a circle with the same area. "
+    "The log-population term ensures the chosen city is large enough to host a "
+    "congressional office. The exponential distance term rewards cities near where "
+    "the district's people actually live — a city at the exact centroid scores the full "
+    "log(population) with no penalty, while a city one district-radius away scores about "
+    "37% of that. To outscore a centroid city, a more distant city must be substantially "
+    "larger: a city two district-radii away needs to be roughly 7× more populous. "
+    "The goal is a city that is both accessible to the whole district and significant "
+    "enough to support a working congressional office — not simply the largest city "
+    "in the district, and not simply the one closest to the geographic centre. "
+    "If no qualified city falls inside a district boundary (rare in dense states, "
+    "more common in large rural districts), the nearest outside city is used as a fallback.",
     ps["body"]))
-story.append(RLImage(SUMMARY_PNG,width=6.8*inch,height=3.1*inch))
+story.append(RLImage(MAP_PNG, width=_map_embed_body[0], height=_map_embed_body[1]))
+story.append(Spacer(1,14))
+story.append(Paragraph(
+    "The map below shows the same districts as solid color fills, with splitline "
+    "overlays tracing how each district boundary was derived. District labels show "
+    "the district number and population in thousands.",
+    ps["body"]))
+story.append(RLImage(FILLED_PNG, width=_filled_embed[0], height=_filled_embed[1]))
+story.append(Spacer(1,14))
 
 # Process pages
 for page in range(n_pages):
     story.append(PageBreak())
-    end_n=min(page*2+2,n_splits)
-    story.append(Paragraph(
-        f"How the Districts Were Built — Split {page*2+1}"
-        +(f" & {page*2+2}" if page*2+1<n_splits else ""),ps["h1"]))
-    story.append(Paragraph(
-        "The full state is shown. Census blocks are shaded teal (Side A) or "
-        "salmon (Side B) based on which side of the new bisecting line they fall on — "
-        "not left or right, since the line is diagonal. "
-        "The ● dot marks the population-weighted center of the sub-region being split, "
-        "which is the anchor point through which the bisecting line passes.",
-        ps["body"]))
-    ppath=process_page_path(page+1)
+    split_ids = [page * 2, page * 2 + 1]
+    valid_ids  = [si for si in split_ids if si < n_splits]
+    title_part = (f"Split {valid_ids[0]+1} & {valid_ids[1]+1}"
+                  if len(valid_ids) == 2
+                  else f"Split {valid_ids[0]+1}" if valid_ids
+                  else "Final Districts")
+    story.append(Paragraph(f"How the Districts Were Built — {title_part}", ps["h1"]))
+
+    # Intro text on the first process page only
+    if page == 0:
+        story.append(Paragraph(
+            "Each diagram is zoomed into the sub-region being bisected. "
+            "The inset (bottom-right) shows where that sub-region sits within the full state. "
+            "Census blocks are shaded teal (Side A) or salmon (Side B) based on which side "
+            "of the bisecting line they fall on. "
+            "The ● dot marks the population-weighted center of the sub-region — "
+            "the anchor point through which every bisecting line passes.",
+            ps["body"]))
+
+    # Per-split explanatory text
+    for si in valid_ids:
+        s = split_log[si]
+        seed_dir = "NW–SE" if s["seed_angle"] == FIRST_CUT_ANGLE else "NE–SW"
+        total_pop_here = s["pop_left"] + s["pop_right"]
+        landed_note = (
+            f"The goal-seek started at {s['seed_angle']:.0f}° ({seed_dir}) "
+            f"and landed at {s['angle_deg']:.1f}° after sweeping "
+            f"{abs(s['angle_deg'] - s['seed_angle']):.0f}° to find the best balance."
+            if abs(s["angle_deg"] - s["seed_angle"]) > 0.9
+            else f"The seed angle of {s['seed_angle']:.0f}° ({seed_dir}) "
+                 f"was already near-optimal (landed at {s['angle_deg']:.1f}°).")
+        story.append(Paragraph(
+            f"<b>Split {si + 1}:</b> A sub-region of {total_pop_here:,} people is bisected "
+            f"through its population center (●). {landed_note} "
+            f"Balance error: {s['balance_err']:.3f}%. "
+            f"Side A (teal): {s['pop_left']:,} · Side B (salmon): {s['pop_right']:,}.",
+            ps["body"]))
+
+    ppath = process_page_path(page + 1)
     if os.path.exists(ppath):
-        story.append(RLImage(ppath,width=6.8*inch,height=3.4*inch))
+        story.append(RLImage(ppath, width=6.8*inch, height=3.4*inch))
+
+# Border-swap section
+# Derive state-specific city examples from the actual run data
+_most_compact   = max(summary_rows, key=lambda r: r["pp_compactness"])
+_least_compact  = min(summary_rows, key=lambda r: r["pp_compactness"])
+_urban_example  = _most_compact["nearest_city"]
+_rural_example  = _least_compact["nearest_city"]
+
+story.append(PageBreak())
+story.append(Paragraph("Step 2: Border-Swap Refinement", ps["h1"]))
+story.append(Paragraph(
+    "The splitlines produce geometrically clean cuts but rarely land exactly on "
+    "a census block boundary, which leaves small population imbalances. "
+    "A border-swap pass corrects this without using any political information.",
+    ps["body"]))
+story.append(Paragraph("How the swap works", ps["h2"]))
+story.append(Paragraph(
+    "After all splits are complete, the algorithm builds an adjacency graph — every "
+    "census block knows which other blocks it physically touches. "
+    f"It then runs up to {N_SWAP_ROUNDS} rounds. In each round, every block on a "
+    "district boundary is considered for reassignment: if moving it to the "
+    "neighboring district would reduce the maximum population deviation across all "
+    "districts, the move is made. Blocks are only ever moved one at a time, and only "
+    "when the move strictly improves balance. The pass stops early once all districts "
+    "are within the 1% tolerance.",
+    ps["body"]))
+story.append(Paragraph("Why the boundaries look jagged", ps["h2"]))
+story.append(Paragraph(
+    f"The straight splitline is superseded by the swap. The final district boundary "
+    f"is the outer edge of whichever census blocks belong to each district after "
+    f"swapping — a path that follows census block edges. In {STATE_NAME}, census "
+    f"blocks vary widely in size: tiny blocks in dense urban areas like "
+    f"{escape_xml(_urban_example)} versus large blocks in sparse rural areas like "
+    f"the {escape_xml(_rural_example)} region. The boundary is jagged where blocks "
+    f"are small and tightly packed, and smooth where blocks are large and sparse.",
+    ps["body"]))
+if os.path.exists(SWAP_PNG):
+    story.append(Paragraph(
+        "The two maps below show the full state before and after the swap step. "
+        "Left: districts colored by the splitline assignment alone, with bisection "
+        "lines overlaid. Right: the final assignment after swapping — boundaries "
+        "now follow census block edges rather than straight geometric lines.",
+        ps["body"]))
+    _swap_embed = _img_embed(SWAP_PNG, 6.8)
+    story.append(RLImage(SWAP_PNG, width=_swap_embed[0], height=_swap_embed[1]))
+if os.path.exists(SWAP_ZOOM_PNG):
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(
+        "The map below is zoomed into the area with the most block reassignments, "
+        "showing the original bisection lines overlaid on the final district colors. "
+        "The straight lines mark where the algorithm made its cuts; the jagged color "
+        "boundaries show where census blocks actually fall.",
+        ps["body"]))
+    _zoom_embed = _img_embed(SWAP_ZOOM_PNG, 6.8)
+    story.append(RLImage(SWAP_ZOOM_PNG, width=_zoom_embed[0], height=_zoom_embed[1]))
 
 # Appendix
 story.append(PageBreak())
@@ -1665,7 +2425,7 @@ for fn_name,fn_desc in key_fns:
 story.append(Spacer(1,12))
 story.append(HRFlowable(width="100%",thickness=1,color=PDF_MGRAY,spaceAfter=8))
 story.append(Paragraph(
-    f"{STATE_NAME} Fair Redistricting {VERSION}  |  {APPORTIONMENT_YEAR} U.S. Census  |  "
+    f"{STATE_NAME} Population-Bisecting Splitline Redistricting {VERSION}  |  {APPORTIONMENT_YEAR} U.S. Census  |  "
     f"{N_DISTRICTS} Congressional Districts  |  Prepared by: {AUTHOR}  |  "
     f"Full source: {os.path.basename(CODE_PDF)}",ps["foot"]))
 
